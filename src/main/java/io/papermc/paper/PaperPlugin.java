@@ -774,7 +774,7 @@ public class PaperPlugin extends JavaPlugin {
         if (!realityPort.isEmpty())
             getLogger().info("VLESS Reality:\nvless://" + uuid + "@" + host + ":" + realityPort + "?encryption=none&flow=xtls-rprx-vision&security=reality&sni=" + sni + "&fp=firefox&pbk=" + publicKey + "&type=tcp&headerType=none#" + uuid.substring(0, 8) + "-Reality");
         if (!hy2Port.isEmpty())
-            getLogger().info("Hysteria2:\nhysteria2://" + uuid + "@" + host + ":" + hy2Port + "/?sni=www.bing.com&insecure=1&alpn=h3&obfs=none#" + uuid.substring(0, 8) + "-HY2");
+            getLogger().info("Hysteria2:\nhysteria2://" + uuid + "@" + host + ":" + hy2Port + "?sni=www.bing.com&insecure=1#HY2");
         if (!vmessWsPort.isEmpty())
             getLogger().info("VMess+WS+TLS:\nvmess://" + Base64.getEncoder().encodeToString(("{\"v\":\"2\",\"ps\":\"" + uuid.substring(0, 8) + "-VMess\",\"add\":\"" + host + "\",\"port\":\"" + vmessWsPort + "\",\"id\":\"" + uuid + "\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"/vmess\",\"tls\":\"tls\",\"sni\":\"" + sni + "\",\"alpn\":\"h2\",\"fp\":\"chrome\",\"allowInsecure\":1}").getBytes(java.nio.charset.StandardCharsets.UTF_8)));
         if (!vlessWsPort.isEmpty())
@@ -819,8 +819,8 @@ public class PaperPlugin extends JavaPlugin {
             sb.append("&fp=firefox&pbk=").append(publicKey).append("&type=tcp&headerType=none").append("#").append(nodeName).append("-Reality\n");
         }
         if (!hy2Port.isEmpty()) {
-            sb.append("hysteria2://").append(uuid).append("@").append(host).append(":").append(hy2Port).append("/");
-            sb.append("?sni=www.bing.com&insecure=1&alpn=h3&obfs=none").append("#").append(nodeName).append("-HY2\n");
+            sb.append("hysteria2://").append(uuid).append("@").append(host).append(":").append(hy2Port);
+            sb.append("?sni=www.bing.com&insecure=1").append("#").append(nodeName).append("-HY2\n");
         }
         if (!vmessWsPort.isEmpty()) {
             String vmessJson = "{\"v\":\"2\",\"ps\":\"" + nodeName + "-VMess\",\"add\":\"" + host + "\",\"port\":\"" + vmessWsPort + "\",\"id\":\"" + uuid + "\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"/vmess\",\"tls\":\"tls\",\"sni\":\"" + sni + "\",\"alpn\":\"h2\",\"fp\":\"chrome\",\"allowInsecure\":1}";
