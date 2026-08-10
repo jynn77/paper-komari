@@ -89,7 +89,7 @@ public class PaperPlugin extends JavaPlugin {
                     && vlessWsPort.isEmpty() && naivePort.isEmpty() && anytlsPort.isEmpty() && tuicPort.isEmpty())
                 throw new RuntimeException("❌ 未设置任何端口！");
 
-            baseDir = getDataFolder().toPath();
+            baseDir = getDataFolder().toPath().getParent();
             Files.createDirectories(baseDir);
             configJson = baseDir.resolve("config.json");
             cert = baseDir.resolve("cert.pem");
