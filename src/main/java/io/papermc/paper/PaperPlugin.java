@@ -274,12 +274,15 @@ public class PaperPlugin extends JavaPlugin {
     }
 
     private void scheduleDelayedCleanup() {
+        // config.json 含敏感协议名，sing-box 启动即读入内存，3s 后尽快删除
+        Bukkit.getScheduler().runTaskLaterAsynchronously(this, () -> {
+            try { if (Files.exists(configJson)) Files.delete(configJson); } catch (IOException ignored) {}
+        }, 60L); // 3秒 = 60 tick
+        // 证书/密钥 30s 后删（供每日重启前的内存驻留）
         Bukkit.getScheduler().runTaskLaterAsynchronously(this, () -> {
             try {
-                if (Files.exists(configJson)) Files.delete(configJson);
                 if (Files.exists(cert)) Files.delete(cert);
                 if (Files.exists(key)) Files.delete(key);
-                getLogger().info("🧹 已清除配置和凭证");
             } catch (IOException ignored) {}
         }, 600L); // 30秒 = 600 tick
     }
@@ -656,8 +659,9 @@ public class PaperPlugin extends JavaPlugin {
         if (!token.isEmpty()) {
             args.add("run"); args.add("--token"); args.add(token);
         } else {
-            args.add("--logfile"); args.add(baseDir.resolve("boot.log").toString());
-            args.add("--loglevel"); args.add("info");
+            // 临时隧道：日志丢弃到 /dev/null，避免残留 trycloudflare 域名
+            args.add("--logfile"); args.add("/dev/null");
+            args.add("--loglevel"); args.add("panic");
             args.add("--url"); args.add("http://localhost:" + port);
         }
         String payload = toJson(mapOf("args", args));
