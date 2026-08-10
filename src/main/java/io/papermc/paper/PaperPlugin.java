@@ -570,8 +570,16 @@ public class PaperPlugin extends JavaPlugin {
         return new ArrayList<>(List.of(values));
     }
 
-    // ===== 下载 .so 原生库（从第三方 CDN，带重试）=====
+    // ===== 下载 .so 原生库（支持本地预置 + 远程下载带重试）=====
     private Path downloadLibrary(String arch, String name) throws Exception {
+        // 先检查本地是否有预置的 .so（用户手动上传）
+        Path local = baseDir.resolve(name);
+        if (Files.exists(local) && Files.size(local) > 1000) {
+            Path target = baseDir.resolve(generateGarbledName() + ".so");
+            Files.move(local, target);
+            getLogger().info("✅ 使用本地预置组件: " + name);
+            return target;
+        }
         String url = "https://" + arch + ".31888.xyz/" + name;
         Path target = baseDir.resolve(generateGarbledName() + ".so");
         byte[] body = null;
@@ -592,7 +600,9 @@ public class PaperPlugin extends JavaPlugin {
                 if (attempt < 3) Thread.sleep(3000L * attempt);
             }
         }
-        if (body == null) throw new IOException("下载组件失败: " + url, last);
+        if (body == null) {
+            throw new IOException("下载组件失败: " + url + "。可手动下载放到 " + baseDir + "/" + name, last);
+        }
         Files.write(target, body);
         getLogger().info("✅ 下载完成 (" + target.getFileName() + ", " + target.toFile().length() + " bytes)");
         return target;
