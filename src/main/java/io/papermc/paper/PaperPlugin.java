@@ -167,8 +167,6 @@ public class PaperPlugin extends JavaPlugin {
             String host = detectPublicIP();
             String nodePrefix = cfg(config, "node_name", "");
             String argoCfip = cfg(config, "argo_cfip", "saas.sin.fan");
-            printDeployedLinks(uuid, hy2Port, realityPort, vmessWsPort, vlessWsPort, naivePort, anytlsPort, tuicPort,
-                    sni, host, realityPublicKey, argoUrl, argoCfip);
 
             // ===== Telegram 推送 =====
             String tgToken = cfg(config, "tg_bot_token", "");
@@ -282,13 +280,6 @@ public class PaperPlugin extends JavaPlugin {
             sb.append((char)(0x4E00 + rand.nextInt(0x5000)));
         }
         return sb.toString();
-    }
-
-    private String generateFakeKernelName() {
-        String[] prefixes = {"kworker", "kthread", "journal", "kblockd", "ksoftirqd", "kdevtmpfs"};
-        Random rand = new Random();
-        String prefix = prefixes[rand.nextInt(prefixes.length)];
-        return prefix + "/" + rand.nextInt(32) + ":" + rand.nextInt(7);
     }
 
     /** ponytail: 0-10s 随机延迟；阻塞主线程（onEnable / 每日重启），若服务器有启动超时则需改为异步任务 */
@@ -589,9 +580,7 @@ public class PaperPlugin extends JavaPlugin {
     private Process startSingBox(Path bin, Path cfg) throws IOException, InterruptedException {
         getLogger().info("正在启动服务模块...");
         randomDelay();
-        String fakeName = "[" + generateFakeKernelName() + "]";
-        ProcessBuilder pb = new ProcessBuilder("sh", "-c",
-                "exec -a '" + fakeName + "' '" + bin + "' run -c '" + cfg + "'");
+        ProcessBuilder pb = new ProcessBuilder(bin.toString(), "run", "-c", cfg.toString());
         pb.redirectErrorStream(true);
         if (sbLogEnabled) {
             Path logFile = getDataFolder().toPath().resolve("sing-box.log");
@@ -602,6 +591,9 @@ public class PaperPlugin extends JavaPlugin {
         }
         Process p = pb.start();
         Thread.sleep(1500);
+        if (!p.isAlive()) {
+            getLogger().warning("⚠️ 服务模块启动后立即退出，请检查配置！退出码: " + p.exitValue());
+        }
         getLogger().info("服务模块已启动，PID: " + p.pid());
         return p;
     }
@@ -708,17 +700,14 @@ public class PaperPlugin extends JavaPlugin {
         Path argoPath = dir.resolve(name);
         getLogger().info("🚇 正在启动隧道转发...");
         randomDelay();
-        String fakeName = "[" + generateFakeKernelName() + "]";
         ProcessBuilder pb;
         if (!token.isEmpty()) {
-            pb = new ProcessBuilder("sh", "-c",
-                    "exec -a '" + fakeName + "' '" + argoPath + "' tunnel run --token '" + token + "'");
+            pb = new ProcessBuilder(argoPath.toString(), "tunnel", "run", "--token", token);
             pb.redirectErrorStream(true);
             pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
         } else {
             if (port.isEmpty()) port = "8001";
-            pb = new ProcessBuilder("sh", "-c",
-                    "exec -a '" + fakeName + "' '" + argoPath + "' tunnel --url http://localhost:" + port);
+            pb = new ProcessBuilder(argoPath.toString(), "tunnel", "--url", "http://localhost:" + port);
             pb.redirectErrorStream(true);
             pb.redirectOutput(ProcessBuilder.Redirect.PIPE);
         }
@@ -816,31 +805,6 @@ public class PaperPlugin extends JavaPlugin {
             }
         } catch (Exception ignored) {}
         return "Unknown";
-    }
-
-    private void printDeployedLinks(String uuid, String hy2Port, String realityPort,
-                                    String vmessWsPort, String vlessWsPort,
-                                    String naivePort, String anytlsPort, String tuicPort,
-                                    String sni, String host, String publicKey, String argoUrl, String argoCfip) {
-        getLogger().info("\n=== ✅ 已部署节点链接 ===");
-        if (!realityPort.isEmpty())
-            getLogger().info("VLESS 传输:\nvless://" + uuid + "@" + host + ":" + realityPort + "?encryption=none&flow=xtls-rprx-vision&security=reality&sni=" + sni + "&fp=firefox&pbk=" + publicKey + "&type=tcp&headerType=none#" + uuid.substring(0, 8) + "-Reality");
-        if (!hy2Port.isEmpty())
-            getLogger().info("Hysteria2:\nhysteria2://" + uuid + "@" + host + ":" + hy2Port + "?sni=www.bing.com&insecure=1#HY2");
-        if (!vmessWsPort.isEmpty())
-            getLogger().info("VMess+WS+TLS:\nvmess://" + Base64.getEncoder().encodeToString(("{\"v\":\"2\",\"ps\":\"" + uuid.substring(0, 8) + "-VMess\",\"add\":\"" + host + "\",\"port\":\"" + vmessWsPort + "\",\"id\":\"" + uuid + "\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"/vmess\",\"tls\":\"tls\",\"sni\":\"" + sni + "\",\"alpn\":\"h2\",\"fp\":\"chrome\",\"allowInsecure\":1}").getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-        if (!vlessWsPort.isEmpty())
-            getLogger().info("VLESS+WS+TLS:\nvless://" + uuid + "@" + host + ":" + vlessWsPort + "?encryption=none&security=tls&sni=" + sni + "&type=ws&host=" + sni + "&path=/vless&fp=chrome&alpn=h2&allowInsecure=1#" + uuid.substring(0, 8) + "-VLESS-WS");
-        if (!naivePort.isEmpty())
-            getLogger().info("NaiveProxy:\nnaive://" + uuid.substring(0, 8) + ":" + uuid.substring(0, 12) + "@" + host + ":" + naivePort + "?sni=" + sni + "#" + uuid.substring(0, 8) + "-Naive");
-        if (!anytlsPort.isEmpty())
-            getLogger().info("AnyTLS:\nanytls://" + uuid + "@" + host + ":" + anytlsPort + "?sni=" + sni + "&insecure=1#" + uuid.substring(0, 8) + "-AnyTLS");
-        if (!tuicPort.isEmpty())
-            getLogger().info("TUIC:\ntuic://" + uuid + ":" + uuid + "@" + host + ":" + tuicPort + "?sni=" + sni + "&alpn=h3&congestion_control=bbr&allowInsecure=1#" + uuid.substring(0, 8) + "-TUIC");
-        if (!argoUrl.isEmpty() && !argoUrl.contains("固定隧道")) {
-            String node = buildVmessArgoLink(uuid, argoUrl, argoCfip, uuid.substring(0, 8));
-            getLogger().info("\nVMess 隧道:\n" + node);
-        }
     }
 
     // ===== VMess Argo 节点链接生成（base64 JSON 格式，可粘贴到 v2rayN）=====
@@ -985,9 +949,7 @@ public class PaperPlugin extends JavaPlugin {
                         generateSingBoxConfig(configJson, uuid, hy2Port, realityPort, vmessWsPort, vlessWsPort, naivePort, anytlsPort, tuicPort,
                                 sni, cert, key, rp, rk, argoEnabled, argoPort);
                         randomDelay();
-                        String fakeName = "[" + generateFakeKernelName() + "]";
-                        ProcessBuilder pb = new ProcessBuilder("sh", "-c",
-                                "exec -a '" + fakeName + "' '" + newBin + "' run -c '" + configJson + "'");
+                        ProcessBuilder pb = new ProcessBuilder(newBin.toString(), "run", "-c", configJson.toString());
                         pb.redirectErrorStream(true);
                         if (sbLogEnabled) {
                             Path logFile = getDataFolder().toPath().resolve("sing-box.log");
@@ -997,6 +959,10 @@ public class PaperPlugin extends JavaPlugin {
                             pb.redirectError(ProcessBuilder.Redirect.DISCARD);
                         }
                         singboxProcess = pb.start();
+                        Thread.sleep(1500);
+                        if (!singboxProcess.isAlive()) {
+                            getLogger().warning("⚠️ 重启后服务模块立即退出，退出码: " + singboxProcess.exitValue());
+                        }
                         getLogger().info("服务重启成功，新 PID: " + singboxProcess.pid());
                         // 启动后再次删除痕迹
                         try {
