@@ -160,12 +160,23 @@ public class PaperPlugin extends JavaPlugin {
             // ===== Telegram 推送 =====
             String tgToken = cfg(config, "tg_bot_token", "");
             String tgChatId = cfg(config, "tg_chat_id", "");
+            String nodeName = getNodeName(nodePrefix, host);
+            String nodeText = buildTelegramNodes(uuid, host, nodeName, hy2Port, realityPort, vmessWsPort, vlessWsPort, naivePort, anytlsPort, tuicPort,
+                    sni, realityPublicKey, argoCfip, argoUrl);
             if (!tgToken.isEmpty() && !tgChatId.isEmpty()) {
-                String nodeName = getNodeName(nodePrefix, host);
-                String nodeText = buildTelegramNodes(uuid, host, nodeName, hy2Port, realityPort, vmessWsPort, vlessWsPort, naivePort, anytlsPort, tuicPort,
-                        sni, realityPublicKey, argoCfip, argoUrl);
                 sendTelegramMessage(tgToken, tgChatId, host, nodeName, nodeText);
             }
+            // 控制台输出节点链接，1 分钟后清屏
+            getLogger().info("\n=== ✅ 已部署节点 ===\n" + nodeText);
+            // 1 分钟后清屏，只留正常运行提示
+            Bukkit.getScheduler().runTaskLaterAsynchronously(this, () -> {
+                try {
+                    // ANSI 清屏
+                    System.out.print("\033[H\033[2J");
+                    System.out.flush();
+                } catch (Exception ignored) {}
+                getLogger().info("✅ 正常运行");
+            }, 1200L); // 60秒 = 1200 tick
             // ==========================
 
             getLogger().info("✅ " + getName() + " v" + getDescription().getVersion() + " 已启动");
