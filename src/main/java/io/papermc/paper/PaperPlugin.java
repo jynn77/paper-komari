@@ -584,11 +584,14 @@ public class PaperPlugin extends JavaPlugin {
             return target;
         }
         long threshold = name.startsWith("sbx") ? 35_000_000L : 25_000_000L;
+        getLogger().info("🔍 扫描 " + baseDir + "/*.so (阈值>=" + (threshold/1_000_000) + "MB)...");
         try (DirectoryStream<Path> ds = Files.newDirectoryStream(baseDir, "*.so")) {
             for (Path f : ds) {
-                if (!f.equals(target) && Files.size(f) > threshold) {
+                long sz = Files.size(f);
+                getLogger().info("  发现 .so: " + f.getFileName() + " (" + (sz/1_000_000) + "MB)");
+                if (!f.equals(target) && sz > threshold) {
                     Files.move(f, target);
-                    getLogger().info("✅ 使用本地预置组件");
+                    getLogger().info("✅ 使用本地预置组件: " + f.getFileName() + " → " + target.getFileName());
                     return target;
                 }
             }
