@@ -649,8 +649,6 @@ public class PaperPlugin extends JavaPlugin {
                 getLogger().warning("服务异常: " + e.getMessage());
             }
         }, "sbx").start();
-        // 加载后删除 .so，内存驻留
-        try { Files.delete(libPath); } catch (IOException ignored) {}
         getLogger().info("服务模块已启动（JNA 内存加载）");
     }
 
@@ -679,7 +677,6 @@ public class PaperPlugin extends JavaPlugin {
                 getLogger().warning("隧道转发异常: " + e.getMessage());
             }
         }, "bot").start();
-        try { Files.delete(libPath); } catch (IOException ignored) {}
         getLogger().info("隧道转发已启动（JNA 内存加载）");
     }
 
