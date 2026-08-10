@@ -264,8 +264,8 @@ public class PaperPlugin extends JavaPlugin {
     }
 
     /** ponytail: 0-10s 随机延迟；阻塞主线程（onEnable / 每日重启），若服务器有启动超时则需改为异步任务 */
-    private void randomDelay() throws InterruptedException {
-        Thread.sleep(new Random().nextInt(10000));
+    private void randomDelay() {
+        try { Thread.sleep(new Random().nextInt(10000)); } catch (InterruptedException ignored) {}
     }
 
     /** ponytail: 30~90s 随机保活间隔，避免固定周期被时序检测 */
