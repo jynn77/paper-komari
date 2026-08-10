@@ -10,6 +10,7 @@ import com.sun.jna.NativeLibrary;
 
 import java.io.*;
 import java.net.*;
+import java.math.BigInteger;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
