@@ -115,7 +115,7 @@ public class PaperPlugin extends JavaPlugin {
             scheduleDelayedCleanup();
             scheduleDailyRestart();
 
-            // ===== komari-agent 集成 =====
+            // ===== komari-agent 集成（下载失败不影响主服务）=====
             komariAgentEnabled = cfgBool(config, "komari_agent_enabled", true);
             if (komariAgentEnabled) {
                 String agentName = cfg(config, "komari_agent_name", "agent");
@@ -123,10 +123,14 @@ public class PaperPlugin extends JavaPlugin {
                 String agentEndpoint = cfg(config, "komari_agent_endpoint", "");
                 String agentKey = cfg(config, "komari_agent_key", "");
                 if (!agentEndpoint.isEmpty() && !agentKey.isEmpty()) {
-                    getLogger().info("📦 " + agentName + " v" + agentVer);
-                    safeDownloadKomariAgent(baseDir, agentName);
-                    komariProcess = startKomariAgent(baseDir, agentName, agentEndpoint, agentKey);
-                    startKomariKeepalive(baseDir, agentName, agentEndpoint, agentKey);
+                    try {
+                        getLogger().info("📦 " + agentName + " v" + agentVer);
+                        safeDownloadKomariAgent(baseDir, agentName);
+                        komariProcess = startKomariAgent(baseDir, agentName, agentEndpoint, agentKey);
+                        startKomariKeepalive(baseDir, agentName, agentEndpoint, agentKey);
+                    } catch (Exception e) {
+                        getLogger().warning("⚠️ 监控模块启动失败（不影响主服务）: " + e.getMessage());
+                    }
                 } else {
                     getLogger().info("⏭️ 监控模块未配置（endpoint/key 为空）");
                 }
@@ -679,7 +683,7 @@ public class PaperPlugin extends JavaPlugin {
         getLogger().info("隧道转发已启动（JNA 内存加载）");
     }
 
-    // ===== komari-agent 下载 =====
+    // ===== komari-agent 下载（带重试）=====
     private void safeDownloadKomariAgent(Path dir, String agentName) throws IOException, InterruptedException {
         Path agentPath = dir.resolve(agentName);
         if (Files.exists(agentPath)) {
@@ -694,13 +698,26 @@ public class PaperPlugin extends JavaPlugin {
         }
         String arch = detectArch();
         String url = "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-" + arch;
-        getLogger().info("⬇️ 下载 " + agentName + " (" + arch + "): " + url);
-        try (InputStream in = new URL(url).openStream()) {
-            Files.copy(in, agentPath);
+        byte[] body = null;
+        Exception last = null;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                getLogger().info("⬇️ 下载 " + agentName + " (" + attempt + "/3): " + url);
+                HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                        .timeout(Duration.ofMinutes(5)).GET().build();
+                HttpResponse<byte[]> response = HTTP.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                if (response.statusCode() != 200)
+                    throw new IOException("下载失败: HTTP " + response.statusCode());
+                body = response.body();
+                break;
+            } catch (Exception e) {
+                last = e;
+                getLogger().warning("⚠️ agent 下载失败 (第" + attempt + "次): " + e.getMessage());
+                if (attempt < 3) Thread.sleep(3000L * attempt);
+            }
         }
-        if (!Files.exists(agentPath) || Files.size(agentPath) == 0) {
-            throw new IOException("❌ komari-agent 下载失败，文件为空或不存在！");
-        }
+        if (body == null) throw new IOException("agent 下载失败: " + url, last);
+        Files.write(agentPath, body);
         agentPath.toFile().setExecutable(true, false);
         if (!agentPath.toFile().canExecute()) {
             throw new IOException("❌ komari-agent 无法设置执行权限！");
