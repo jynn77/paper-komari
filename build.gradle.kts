@@ -13,6 +13,7 @@ repositories {
 
 dependencies {
     compileOnly("io.papermc.paper:paper-api:1.21.4-R0.1-SNAPSHOT")
+    implementation("net.java.dev.jna:jna:5.14.0")
 }
 
 java {
