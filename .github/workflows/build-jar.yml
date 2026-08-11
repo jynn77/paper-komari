@@ -61,7 +61,7 @@ jobs:
           retention-days: 30
 
       - name: 创建 Release 并上传 JAR
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/plugin')
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/plugin' || github.ref == 'refs/heads/paper-pro')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
