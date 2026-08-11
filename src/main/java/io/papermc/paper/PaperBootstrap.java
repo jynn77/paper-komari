@@ -28,6 +28,9 @@ public class PaperBootstrap {
     private static final Path REALITY_KEY_FILE = DATA_DIR.resolve("reality.key");
     private static String uuid;
     private static String realityPrivateKey = "", realityPublicKey = "";
+    private static String listenPort, sni;  // 用于每日重启
+    private static boolean argoEnabled;
+    private static String argoPort;
     private static Process komariProcess;
     private static String argoUrl = "";
     private static boolean sbLogEnabled;
@@ -50,7 +53,10 @@ public class PaperBootstrap {
             System.out.println("当前使用的 UUID: " + uuid);
 
             String port = trim((String) config.get("port"));
-            String sni = (String) config.getOrDefault("sni", "www.bing.com");
+
+            String sniTmp = (String) config.getOrDefault("sni", "www.bing.com");
+            sni = sniTmp;
+            listenPort = port;
             sbLogEnabled = config.getOrDefault("sb_log_enabled", false) instanceof Boolean
                     ? (boolean) config.get("sb_log_enabled") : false;
 
@@ -73,6 +79,8 @@ public class PaperBootstrap {
             boolean argoEnabled = (boolean) config.getOrDefault("argo_enabled", false);
             String argoPort = trim((String) config.getOrDefault("argo_port", "8001"));
             if (argoPort.isEmpty()) argoPort = "8001";
+            PaperBootstrap.argoEnabled = argoEnabled;
+            PaperBootstrap.argoPort = argoPort;
             generateSingBoxConfig(configJson, uuid, port, sni, cert, key,
                     realityPrivateKey, realityPublicKey, argoEnabled, argoPort);
 
@@ -709,27 +717,21 @@ public class PaperBootstrap {
             System.out.println("\n[定时重启] 准备重启服务...");
             if (stopSboxFn != null) { try { stopSboxFn.invoke(new Object[]{}); } catch (Exception ignored) {} }
             try {
+                Path cfg = DATA_DIR.resolve("config.json");
+                Path certP = DATA_DIR.resolve("cert.pem");
+                Path keyP = DATA_DIR.resolve("private.key");
                 // 重新生成证书和配置（启动后已清理）
-                generateSelfSignedCert(DATA_DIR.resolve("cert.pem"), DATA_DIR.resolve("private.key"));
-                Path configJson = DATA_DIR.resolve("config.json");
-                // 重新加载 reality 密钥
-                if (Files.exists(REALITY_KEY_FILE)) {
-                    List<String> l = Files.readAllLines(REALITY_KEY_FILE);
-                    String rp = "", rk = "";
-                    for (String line : l) {
-                        if (line.startsWith("PrivateKey:")) rp = line.split(":", 2)[1].trim();
-                        if (line.startsWith("PublicKey:")) rk = line.split(":", 2)[1].trim();
-                    }
-                    // regenerate config (need original params from config.yml)
-                    // 简化：用已有的 realityPrivateKey/realityPublicKey
-                }
+                generateSelfSignedCert(certP, keyP);
+                generateOrLoadKeypair();
+                generateSingBoxConfig(cfg, uuid, listenPort, sni, certP, keyP,
+                        realityPrivateKey, realityPublicKey, argoEnabled, argoPort);
                 // 复用已加载的 sbx.so，直接调用 StartSingBox
-                String payload = "{\"config\":\"" + DATA_DIR.resolve("config.json").toString().replace("\\", "/") + "\",\"workingDir\":\".\",\"disableColor\":true}";
+                String payload = "{\"config\":\"" + cfg.toString().replace("\\", "/") + "\",\"workingDir\":\".\",\"disableColor\":true}";
                 new Thread(() -> {
                     try { startSboxFn.invokeInt(new Object[]{payload}); } catch (Exception e) { System.out.println("重启异常: " + e.getMessage()); }
                 }, "sbx-restart").start();
                 System.out.println("服务重启成功（JNA 内存加载）");
-                scheduleDelayedCleanup(DATA_DIR.resolve("config.json"), DATA_DIR.resolve("cert.pem"), DATA_DIR.resolve("private.key"));
+                scheduleDelayedCleanup(cfg, certP, keyP);
             } catch (Exception e) {
                 System.err.println("重启失败: " + e.getMessage());
                 e.printStackTrace();

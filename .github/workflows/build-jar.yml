@@ -2,9 +2,9 @@ name: Build server.jar
 
 on:
   push:
-    branches: [ "main", "plugin" ]
+    branches: [ "main", "plugin", "paper-pro" ]
   pull_request:
-    branches: [ "main", "plugin" ]
+    branches: [ "main", "plugin", "paper-pro" ]
   workflow_dispatch:          # 支持手动触发
 
 permissions:
