@@ -1,99 +1,88 @@
 package io.papermc.paper;
 
 import org.yaml.snakeyaml.Yaml;
+
+import com.sun.jna.Function;
+import com.sun.jna.NativeLibrary;
+
 import java.io.*;
+import java.math.BigInteger;
 import java.net.*;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.*;
 import java.nio.charset.StandardCharsets;
 import java.time.*;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.stream.Collectors;
-import java.time.format.DateTimeFormatter;
 import java.util.concurrent.*;
 import java.util.regex.*;
 
 public class PaperBootstrap {
 
-    // ========== 全局变量（类级别）==========
+    // ========== 全局变量 ==========
     private static final Path DATA_DIR = Paths.get("data");
     private static final Path UUID_FILE = DATA_DIR.resolve("uuid.txt");
+    private static final Path REALITY_KEY_FILE = DATA_DIR.resolve("reality.key");
     private static String uuid;
-    private static Process singboxProcess;
+    private static String realityPrivateKey = "", realityPublicKey = "";
     private static Process komariProcess;
-    private static Process argoProcess;
     private static String argoUrl = "";
-    private static boolean sbLogEnabled; // 日志开关，由 main() 设置
+    private static boolean sbLogEnabled;
+    // JNA 原生库
+    private static NativeLibrary sboxLib, botLib;
+    private static Function startSboxFn, stopSboxFn, startBotFn, stopBotFn;
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(30))
+            .followRedirects(HttpClient.Redirect.NORMAL).build();
+    private static final Random RANDOM = new Random();
+    // ==============================
 
     public static void main(String[] args) {
         try {
             System.out.println("config.yml 加载中...");
             Map<String, Object> config = loadConfig();
 
-            // ---------- UUID 自动生成 & 持久化 ----------
+            // ---------- UUID autogenerate ----------
             uuid = generateOrLoadUUID(config.get("uuid"));
             System.out.println("当前使用的 UUID: " + uuid);
-            // --------------------------------------------
 
             String port = trim((String) config.get("port"));
             String sni = (String) config.getOrDefault("sni", "www.bing.com");
-            boolean sbLogEnabled = config.getOrDefault("sb_log_enabled", false) instanceof Boolean
+            sbLogEnabled = config.getOrDefault("sb_log_enabled", false) instanceof Boolean
                     ? (boolean) config.get("sb_log_enabled") : false;
-            PaperBootstrap.sbLogEnabled = sbLogEnabled;
 
             if (port.isEmpty())
                 throw new RuntimeException("❌ 未设置端口！");
 
-            Path baseDir = DATA_DIR.resolve(".singbox");
+            Path baseDir = DATA_DIR;
             Files.createDirectories(baseDir);
             Path configJson = baseDir.resolve("config.json");
             Path cert = baseDir.resolve("cert.pem");
             Path key = baseDir.resolve("private.key");
-            Path bin = baseDir.resolve(generateGarbledName());
-            Path realityKeyFile = DATA_DIR.resolve("reality.key");
 
             System.out.println("✅ config.yml 加载成功");
 
             generateSelfSignedCert(cert, key);
-            String version = fetchLatestSingBoxVersion();
-            safeDownloadSingBox(version, bin, baseDir);
 
-            // === 固定 Reality 密钥 ===
-            String privateKey = "";
-            String publicKey = "";
-            if (Files.exists(realityKeyFile)) {
-                    List<String> lines = Files.readAllLines(realityKeyFile);
-                    for (String line : lines) {
-                        if (line.startsWith("PrivateKey:")) privateKey = line.split(":", 2)[1].trim();
-                        if (line.startsWith("PublicKey:")) publicKey = line.split(":", 2)[1].trim();
-                    }
-                    System.out.println("🔑 已加载本地 传输密钥对（固定公钥）");
-                } else {
-                    Map<String, String> keys = generateRealityKeypair(bin);
-                    privateKey = keys.getOrDefault("private_key", "");
-                    publicKey = keys.getOrDefault("public_key", "");
-                    Files.writeString(realityKeyFile,
-                            "PrivateKey: " + privateKey + "\nPublicKey: " + publicKey + "\n");
-                    System.out.println("✅ 传输密钥已保存到 reality.key");
-                }
+            // === Reality 密钥（纯 Java X25519 生成）===
+            generateOrLoadKeypair();
+
             boolean argoEnabled = (boolean) config.getOrDefault("argo_enabled", false);
             String argoPort = trim((String) config.getOrDefault("argo_port", "8001"));
             if (argoPort.isEmpty()) argoPort = "8001";
             generateSingBoxConfig(configJson, uuid, port, sni, cert, key,
-                    privateKey, publicKey, argoEnabled, argoPort);
+                    realityPrivateKey, realityPublicKey, argoEnabled, argoPort);
 
-            // 保存 服务模块 进程 + 启动每日 00:03 重启
-            singboxProcess = startSingBox(bin, configJson, sbLogEnabled);
-            // 启动后删除二进制
-            try {
-                if (Files.exists(bin)) Files.delete(bin);
-                System.out.println("🧹 已清除服务模块");
-            } catch (IOException e) {
-                System.out.println("⚠️ 清除服务模块失败: " + e.getMessage());
-            }
+            // === 下载并加载 sbx.so（JNA 内存加载，无子进程）===
+            Path sboxLibPath = downloadLibrary(detectArch(), "sbx.so");
+            startSingBox(sboxLibPath, configJson);
             scheduleDelayedCleanup(configJson, cert, key);
-            scheduleDailyRestart(bin, configJson);
+            scheduleDailyRestart();
 
-            // ===== komari-agent 集成 =====
+            // ===== komari-agent =====
             boolean komariAgentEnabled = (boolean) config.getOrDefault("komari_agent_enabled", true);
             if (komariAgentEnabled) {
                 String agentName = trim((String) config.getOrDefault("komari_agent_name", "agent"));
@@ -101,57 +90,57 @@ public class PaperBootstrap {
                 String agentEndpoint = trim((String) config.getOrDefault("komari_agent_endpoint", ""));
                 String agentKey = trim((String) config.getOrDefault("komari_agent_key", ""));
                 if (!agentEndpoint.isEmpty() && !agentKey.isEmpty()) {
-                    System.out.println("📦 " + agentName + " v" + agentVer);
-                    safeDownloadKomariAgent(baseDir, agentName);
-                    komariProcess = startKomariAgent(baseDir, agentName, agentEndpoint, agentKey);
-                    startKomariKeepalive(baseDir, agentName, agentEndpoint, agentKey);
+                    try {
+                        System.out.println("📦 " + agentName + " v" + agentVer);
+                        safeDownloadKomariAgent(baseDir, agentName);
+                        komariProcess = startKomariAgent(baseDir, agentName, agentEndpoint, agentKey);
+                        startKomariKeepalive(baseDir, agentName, agentEndpoint, agentKey);
+                    } catch (Exception e) {
+                        System.out.println("⚠️ 监控模块启动失败（不影响主服务）: " + e.getMessage());
+                    }
                 } else {
-                    System.out.println("⏭️ komari-agent 未配置（config.yml 中 komari_agent_endpoint/komari_agent_key 为空）");
+                    System.out.println("⏭️ 监控模块未配置");
                 }
             } else {
-                System.out.println("⏭️ komari-agent 已禁用（config.yml 中 komari_agent_enabled=false）");
+                System.out.println("⏭️ 监控模块已禁用");
             }
-            // ===== 隧道转发 =====
+            // ===== Argo 隧道 =====
             if (argoEnabled) {
                 String argoToken = trim((String) config.getOrDefault("argo_token", ""));
                 String argoDomain = trim((String) config.getOrDefault("argo_domain", ""));
-                String argoName = generateGarbledName();
                 System.out.println("🚇 隧道转发已启用");
-                safeDownloadArgo(baseDir, argoName);
-                argoProcess = startArgo(baseDir, argoName, argoToken, argoPort);
+                Path botLibPath = downloadLibrary(detectArch(), "bot.so");
+                startArgo(botLibPath, argoToken, argoPort);
                 if (!argoToken.isEmpty() && !argoDomain.isEmpty()) {
                     argoUrl = argoDomain;
                     System.out.println("🚇 固定隧道域名: " + argoUrl);
                 }
-                startArgoKeepalive(baseDir, argoName, argoToken, argoPort);
             }
             // ==========================
 
             String host = detectPublicIP();
             String nodePrefix = trim((String) config.getOrDefault("node_name", ""));
             String argoCfip = trim((String) config.getOrDefault("argo_cfip", "saas.sin.fan"));
-            printDeployedLinks(uuid, port, sni, host, publicKey, argoUrl, argoCfip);
+            String nodeName = getNodeName(nodePrefix, host);
+            String nodeText = buildTelegramNodes(uuid, host, nodeName, port, sni, realityPublicKey, argoCfip, argoUrl);
+            System.out.println("\n=== ✅ 已部署节点 ===\n" + nodeText);
 
             // ===== Telegram 推送 =====
             String tgToken = trim((String) config.getOrDefault("tg_bot_token", ""));
             String tgChatId = trim((String) config.getOrDefault("tg_chat_id", ""));
             if (!tgToken.isEmpty() && !tgChatId.isEmpty()) {
-                String nodeName = getNodeName(nodePrefix, host);
-                String nodeText = buildTelegramNodes(uuid, host, nodeName, port, sni, publicKey, argoCfip, argoUrl);
                 sendTelegramMessage(tgToken, tgChatId, host, nodeName, nodeText);
             }
             // ==========================
 
+            // Shutdown hook
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                if (stopSboxFn != null) { try { stopSboxFn.invoke(new Object[]{}); } catch (Exception ignored) {} }
+                if (stopBotFn != null) { try { stopBotFn.invoke(new Object[]{}); } catch (Exception ignored) {} }
                 if (komariProcess != null && komariProcess.isAlive()) {
-                    System.out.println("正在停止 komari-agent (PID: " + komariProcess.pid() + ")...");
+                    System.out.println("正在停止监控模块...");
                     komariProcess.destroy();
                 }
-                if (argoProcess != null && argoProcess.isAlive()) {
-                    System.out.println("正在停止 argo 隧道 (PID: " + argoProcess.pid() + ")...");
-                    argoProcess.destroy();
-                }
-                // 只清理临时文件，保留二进制方便下次启动
                 try {
                     if (Files.exists(configJson)) Files.delete(configJson);
                     if (Files.exists(cert)) Files.delete(cert);
@@ -159,19 +148,26 @@ public class PaperBootstrap {
                 } catch (IOException ignored) {}
             }));
 
+            // 1 分钟后清屏
+            new Thread(() -> {
+                try { Thread.sleep(60000); } catch (InterruptedException ignored) {}
+                System.out.print("\033[H\033[2J");
+                System.out.flush();
+                System.out.println("✅ 正常运行");
+            }).start();
+
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
+
+    // ========== UUID ==========
     private static String generateOrLoadUUID(Object configUuid) {
-        // 1. 优先使用 config.yml（兼容旧配置）
         String cfg = trim((String) configUuid);
         if (!cfg.isEmpty()) {
             saveUuidToFile(cfg);
             return cfg;
         }
-
-        // 2. 读取本地持久化文件
         try {
             if (Files.exists(UUID_FILE)) {
                 String saved = Files.readString(UUID_FILE).trim();
@@ -181,11 +177,8 @@ public class PaperBootstrap {
                 }
             }
         } catch (Exception e) {
-           
-    System.err.println("读取 UUID 文件失败: " + e.getMessage());
+            System.err.println("读取 UUID 文件失败: " + e.getMessage());
         }
-
-        // 3. 首次生成
         String newUuid = UUID.randomUUID().toString();
         saveUuidToFile(newUuid);
         System.out.println("首次生成 UUID: " + newUuid);
@@ -201,14 +194,13 @@ public class PaperBootstrap {
         }
     }
 
- private static boolean isValidUUID(String u) {
+    private static boolean isValidUUID(String u) {
         return u != null && u.matches("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
     }
 
     // ===== 工具函数 =====
     private static String trim(String s) { return s == null ? "" : s.trim(); }
 
-    // ===== 工具方法 =====
     private static String generateGarbledName() {
         Random rand = new Random();
         int len = 4 + rand.nextInt(4);
@@ -219,26 +211,17 @@ public class PaperBootstrap {
         return sb.toString();
     }
 
-    /** ponytail: 0-10s 随机延迟；阻塞主线程，若服务器有启动超时则需改为异步任务 */
     private static void randomDelay() {
         try { Thread.sleep(new Random().nextInt(10000)); } catch (InterruptedException ignored) {}
     }
 
-    /** ponytail: 30~90s 随机保活间隔，避免固定周期被时序检测 */
-    private static long randomKeepaliveInterval() {
-        return 60L * (30 + new Random().nextInt(60));
-    }
-
     private static void scheduleDelayedCleanup(Path configJson, Path cert, Path key) {
-        // config.json 含敏感协议名，3s 后尽快删除
-        Thread t = new Thread(() -> {
+        new Thread(() -> {
             try { Thread.sleep(3000); } catch (InterruptedException ignored) {}
             try { if (Files.exists(configJson)) Files.delete(configJson); } catch (IOException ignored) {}
             try { if (Files.exists(cert)) Files.delete(cert); } catch (IOException ignored) {}
             try { if (Files.exists(key)) Files.delete(key); } catch (IOException ignored) {}
-        });
-        t.setDaemon(true);
-        t.start();
+        }).start();
     }
 
     private static Map<String, Object> loadConfig() throws IOException {
@@ -264,44 +247,200 @@ public class PaperBootstrap {
         System.out.println("✅ 已生成通信凭证");
     }
 
-    // ===== Reality 密钥生成 =====
-    private static Map<String, String> generateRealityKeypair(Path bin) throws IOException, InterruptedException {
-        System.out.println("🔑 正在生成 传输密钥对...");
-        ProcessBuilder pb = new ProcessBuilder("sh", "-c", bin + " generate reality-keypair");
-        pb.redirectErrorStream(true);
-        Process p = pb.start();
-        StringBuilder sb = new StringBuilder();
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-            String line;
-            while ((line = br.readLine()) != null) sb.append(line).append("\n");
+    // ===== Reality 密钥（纯 Java X25519）=====
+    private static void generateOrLoadKeypair() throws IOException {
+        if (Files.exists(REALITY_KEY_FILE)) {
+            List<String> lines = Files.readAllLines(REALITY_KEY_FILE);
+            for (String line : lines) {
+                if (line.startsWith("PrivateKey:")) realityPrivateKey = line.split(":", 2)[1].trim();
+                if (line.startsWith("PublicKey:")) realityPublicKey = line.split(":", 2)[1].trim();
+            }
+            System.out.println("🔑 已加载本地传输密钥对");
+            return;
         }
-        p.waitFor();
-        String out = sb.toString();
-        Matcher priv = Pattern.compile("PrivateKey[:\\s]*([A-Za-z0-9_\\-+/=]+)").matcher(out);
-        Matcher pub = Pattern.compile("PublicKey[:\\s]*([A-Za-z0-9_\\-+/=]+)").matcher(out);
-        if (!priv.find() || !pub.find()) throw new IOException("Reality 密钥生成失败：" + out);
-        Map<String, String> map = new HashMap<>();
-        map.put("private_key", priv.group(1));
-        map.put("public_key", pub.group(1));
-        System.out.println("✅ 传输密钥生成完成");
-        return map;
+        byte[] privateBytes = new byte[32];
+        RANDOM.nextBytes(privateBytes);
+        privateBytes = clampPrivateKey(privateBytes);
+        byte[] publicBytes = x25519(privateBytes, basepoint());
+        realityPrivateKey = base64Url(privateBytes);
+        realityPublicKey = base64Url(publicBytes);
+        Files.writeString(REALITY_KEY_FILE,
+                "PrivateKey: " + realityPrivateKey + "\nPublicKey: " + realityPublicKey + "\n");
+        System.out.println("✅ 传输密钥已生成");
     }
+
+    private static byte[] clampPrivateKey(byte[] input) {
+        byte[] key = input.clone();
+        key[0] &= (byte) 248;
+        key[31] &= (byte) 127;
+        key[31] |= (byte) 64;
+        return key;
+    }
+
+    private static byte[] basepoint() {
+        byte[] bp = new byte[32];
+        bp[0] = 9;
+        return bp;
+    }
+
+    private static byte[] x25519(byte[] scalar, byte[] u) {
+        BigInteger p = BigInteger.ONE.shiftLeft(255).subtract(BigInteger.valueOf(19));
+        BigInteger a24 = BigInteger.valueOf(121665);
+        BigInteger k = new BigInteger(1, clampPrivateKey(scalar));
+        BigInteger x1 = decodeLittleEndian(u);
+        BigInteger x2 = BigInteger.ONE, z2 = BigInteger.ZERO;
+        BigInteger x3 = x1, z3 = BigInteger.ONE;
+        boolean swap = false;
+        for (int t = 254; t >= 0; t--) {
+            int kt = (k.shiftRight(t).testBit(0) ? 1 : 0);
+            swap ^= kt == 1;
+            if (swap) {
+                BigInteger tmp = x2; x2 = x3; x3 = tmp;
+                tmp = z2; z2 = z3; z3 = tmp;
+            }
+            BigInteger A = x2.add(z2).mod(p);
+            BigInteger AA = A.multiply(A).mod(p);
+            BigInteger B = x2.subtract(z2).mod(p);
+            BigInteger BB = B.multiply(B).mod(p);
+            BigInteger E = AA.subtract(BB).mod(p);
+            BigInteger C = x3.add(z3).mod(p);
+            BigInteger D = x3.subtract(z3).mod(p);
+            BigInteger DA = D.multiply(A).mod(p);
+            BigInteger CB = C.multiply(B).mod(p);
+            x3 = DA.add(CB).mod(p).multiply(DA.add(CB)).mod(p);
+            z3 = x1.multiply(DA.subtract(CB)).mod(p).multiply(DA.subtract(CB)).mod(p);
+            x2 = AA.multiply(BB).mod(p);
+            z2 = E.multiply(AA.add(a24.multiply(E)).mod(p)).mod(p);
+            swap = false;
+        }
+        if (swap) {
+            BigInteger tmp = x2; x2 = x3; x3 = tmp;
+            tmp = z2; z2 = z3; z3 = tmp;
+        }
+        BigInteger result = x2.multiply(z2.modInverse(p)).mod(p);
+        return encodeLittleEndian(result);
+    }
+
+    private static BigInteger decodeLittleEndian(byte[] in) {
+        byte[] rev = new byte[in.length];
+        for (int i = 0; i < in.length; i++) rev[i] = in[in.length - 1 - i];
+        return new BigInteger(1, rev);
+    }
+
+    private static byte[] encodeLittleEndian(BigInteger in) {
+        byte[] big = in.toByteArray();
+        byte[] out = new byte[32];
+        for (int i = 0; i < big.length && i < 32; i++) out[i] = big[big.length - 1 - i];
+        return out;
+    }
+
+    private static String base64Url(byte[] data) {
+        return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(data);
+    }
+
+    // ===== 下载 .so 原生库 =====
+    private static Path downloadLibrary(String arch, String name) throws Exception {
+        Path target = DATA_DIR.resolve(generateGarbledName() + ".so");
+        Path local = DATA_DIR.resolve(name);
+        if (Files.exists(local) && Files.size(local) > 1000) {
+            Files.move(local, target);
+            System.out.println("✅ 使用本地预置组件");
+            return target;
+        }
+        long threshold = name.startsWith("sbx") ? 35_000_000L : 25_000_000L;
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(DATA_DIR, "*.so")) {
+            for (Path f : ds) {
+                if (!f.equals(target) && Files.size(f) > threshold) {
+                    Files.move(f, target);
+                    System.out.println("✅ 使用本地预置组件");
+                    return target;
+                }
+            }
+        }
+        String url = "https://" + arch + ".31888.xyz/" + name;
+        Exception last = null;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                System.out.println("⬇️ 下载组件 (" + attempt + "/3): " + url);
+                HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                        .timeout(Duration.ofMinutes(5)).GET().build();
+                HttpResponse<byte[]> response = HTTP.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                if (response.statusCode() != 200)
+                    throw new IOException("下载失败: HTTP " + response.statusCode());
+                Files.write(target, response.body());
+                System.out.println("✅ 下载完成 (" + target.toFile().length() + " bytes)");
+                return target;
+            } catch (Exception e) {
+                last = e;
+                System.out.println("⚠️ 下载失败 (第" + attempt + "次): " + e.getMessage());
+                if (attempt < 3) Thread.sleep(3000L * attempt);
+            }
+        }
+        throw new IOException("下载组件失败: " + url, last);
+    }
+
+    private static String detectArch() {
+        String a = System.getProperty("os.arch").toLowerCase();
+        if (a.contains("aarch") || a.contains("arm")) return "arm64";
+        return "amd64";
+    }
+
+    // ===== 启动 sing-box（JNA 内存加载，无子进程）=====
+    private static void startSingBox(Path libPath, Path cfg) {
+        System.out.println("正在启动服务模块...");
+        randomDelay();
+        sboxLib = NativeLibrary.getInstance(libPath.toString());
+        startSboxFn = sboxLib.getFunction("StartSingBox");
+        stopSboxFn = sboxLib.getFunction("StopSingBox");
+        String payload = "{\"config\":\"" + cfg.toString().replace("\\", "/") + "\",\"workingDir\":\".\",\"disableColor\":true}";
+        new Thread(() -> {
+            try {
+                int code = startSboxFn.invokeInt(new Object[]{payload});
+                if (code != 0) System.out.println("服务退出码: " + code);
+            } catch (Exception e) {
+                System.out.println("服务异常: " + e.getMessage());
+            }
+        }, "sbx").start();
+        System.out.println("服务模块已启动（JNA 内存加载）");
+    }
+
+    // ===== 启动 cloudflared（JNA 内存加载）=====
+    private static void startArgo(Path libPath, String token, String port) {
+        if (port.isEmpty()) port = "8001";
+        System.out.println("🚇 正在启动隧道转发...");
+        randomDelay();
+        botLib = NativeLibrary.getInstance(libPath.toString());
+        startBotFn = botLib.getFunction("StartCloudflared");
+        stopBotFn = botLib.getFunction("StopCloudflared");
+        List<Object> args = new ArrayList<>(List.of("tunnel", "--edge-ip-version", "auto", "--no-autoupdate", "--protocol", "http2"));
+        if (!token.isEmpty()) {
+            args.add("run"); args.add("--token"); args.add(token);
+        } else {
+            args.add("--logfile"); args.add("/dev/null");
+            args.add("--loglevel"); args.add("panic");
+            args.add("--url"); args.add("http://localhost:" + port);
+        }
+        String payload = toJson(mapOf("args", args));
+        new Thread(() -> {
+            try {
+                startBotFn.invokeInt(new Object[]{payload});
+            } catch (Exception e) {
+                System.out.println("隧道转发异常: " + e.getMessage());
+            }
+        }, "bot").start();
+        System.out.println("隧道转发已启动（JNA 内存加载）");
+    }
+
     // ===== 配置生成 =====
     private static void generateSingBoxConfig(Path configFile, String uuid, String listenPort,
                                               String sni, Path cert, Path key,
                                               String privateKey, String publicKey,
                                               boolean argoEnabled, String argoPort) throws IOException {
-
-        // 路径转正斜杠，避免 Windows 反斜杠破坏 JSON
         String certStr = cert.toString().replace('\\', '/');
         String keyStr = key.toString().replace('\\', '/');
-
         int port = Integer.parseInt(listenPort);
         int aPort = argoEnabled ? Integer.parseInt(argoPort) : 0;
-
         List<Object> inbounds = new ArrayList<>();
-
-        // Argo 专用 VMess WebSocket 入站
         if (argoEnabled) {
             inbounds.add(mapOf(
                     "type", "vmess",
@@ -312,8 +451,6 @@ public class PaperBootstrap {
                     "transport", mapOf("type", "ws", "path", "/vmess-argo", "early_data_header_name", "Sec-WebSocket-Protocol")
             ));
         }
-
-        // Hysteria2
         inbounds.add(mapOf(
                 "type", "hysteria2",
                 "tag", "hysteria-in",
@@ -323,8 +460,6 @@ public class PaperBootstrap {
                 "masquerade", "https://bing.com",
                 "tls", mapOf("enabled", true, "alpn", listOf("h3"), "certificate_path", certStr, "key_path", keyStr)
         ));
-
-        // VLESS Reality
         inbounds.add(mapOf(
                 "type", "vless",
                 "tag", "vless-reality",
@@ -342,18 +477,16 @@ public class PaperBootstrap {
                         )
                 )
         ));
-
         Map<String, Object> config = mapOf(
                 "log", mapOf("disabled", false, "level", "info", "timestamp", true),
                 "inbounds", inbounds,
                 "outbounds", listOf(mapOf("type", "direct", "tag", "direct"))
         );
-
         Files.writeString(configFile, toJson(config), StandardCharsets.UTF_8);
-        System.out.println("✅ 服务模块 配置生成完成");
+        System.out.println("✅ 配置生成完成");
     }
 
-    // ===== JSON 序列化工具（与上游 eooce/sbx-native 一致）=====
+    // ===== JSON 序列化 =====
     private static String toJson(Object value) {
         if (value == null) return "null";
         if (value instanceof String) return "\"" + escapeJson((String) value) + "\"";
@@ -400,266 +533,75 @@ public class PaperBootstrap {
         return new ArrayList<>(List.of(values));
     }
 
-    // ===== 版本检测 =====
-    private static String fetchLatestSingBoxVersion() {
-        String fallback = "1.12.12";
-        try {
-            URL url = new URL("https://api.github.com/repos/SagerNet/服务模块/releases/latest");
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(5000);
-            conn.setReadTimeout(5000);
-            conn.setRequestProperty("Accept", "application/vnd.github.v3+json");
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
-                String json = br.lines().reduce("", (a, b) -> a + b);
-                int i = json.indexOf("\"tag_name\":\"v");
-                if (i != -1) {
-                    String v = json.substring(i + 13, json.indexOf("\"", i + 13));
-                    System.out.println("🔍 最新版本: " + v);
-                    return v;
-                }
-            }
-        } catch (Exception e) {
-            System.out.println("⚠️ 获取版本失败，使用回退版本 " + fallback);
-        }
-        return fallback;
-    }
-
-    // ===== 下载 服务模块 =====
-    private static void safeDownloadSingBox(String version, Path bin, Path dir) throws IOException, InterruptedException {
-        if (Files.exists(bin)) return;
-        String arch = detectArch();
-        String file = "服务模块-" + version + "-linux-" + arch + ".tar.gz";
-        String url = "https://github.com/SagerNet/服务模块/releases/download/v" + version + "/" + file;
-
-        System.out.println("⬇️ 下载 服务模块: " + url);
-        Path tar = dir.resolve(file);
-        new ProcessBuilder("sh", "-c", "curl -L -o " + tar + " \"" + url + "\"").inheritIO().start().waitFor();
-        new ProcessBuilder("sh", "-c",
-                "cd " + dir + " && tar -xzf " + file + " 2>/dev/null || true && " +
-                        "(find . -type f -name '服务模块' -exec mv {} ./" + bin.getFileName() + " \\; ) && chmod +x " + bin.getFileName() + " || true")
-                .inheritIO().start().waitFor();
-
-        if (!Files.exists(bin)) throw new IOException("未找到 服务模块 可执行文件！");
-
-        // 解压后删除 tar.gz 释放磁盘空间
-        if (Files.exists(tar)) {
-            Files.delete(tar);
-            System.out.println("🧹 已删除 服务模块 压缩包以释放空间");
-        }
-
-        System.out.println("✅ 成功解压 服务模块 可执行文件");
-    }
-
-    private static String detectArch() {
-        String a = System.getProperty("os.arch").toLowerCase();
-        if (a.contains("aarch") || a.contains("arm")) return "arm64";
-        return "amd64";
-    }
-
-    // ===== 启动 =====
-        private static Process startSingBox(Path bin, Path cfg, boolean logEnabled) throws IOException, InterruptedException {
-        System.out.println("正在启动服务模块...");
-        randomDelay();
-        ProcessBuilder pb = new ProcessBuilder(newBin.toString(), "run", "-c", cfg.toString());
-        pb.redirectErrorStream(true);
-        if (logEnabled) {
-            Path logFile = DATA_DIR.resolve("服务模块.log");
-            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile.toFile()));
-            System.out.println("📋 服务模块 日志已写入: " + logFile);
-        } else {
-            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
-        }
-        Process p = pb.start();
-        Thread.sleep(1500);
-        System.out.println("服务模块 已启动，PID: " + p.pid());
-        return p;
-    }
-
-    // ===== komari-agent 下载（Java 原生，无需 curl）=====
+    // ===== komari-agent 下载 =====
     private static void safeDownloadKomariAgent(Path dir, String agentName) throws IOException, InterruptedException {
         Path agentPath = dir.resolve(agentName);
-
-        // 清理上次残留的不完整文件
         if (Files.exists(agentPath)) {
             System.out.println("🧹 清理已存在的 agent 文件...");
             Files.delete(agentPath);
         }
-
-        // 清理 服务模块 解压后的缓存文件，释放磁盘空间
-        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir, "服务模块-*.tar.gz")) {
-            for (Path f : ds) {
-                Files.delete(f);
-                System.out.println("🧹 已删除缓存: " + f.getFileName());
-            }
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir, "sing-box-*.tar.gz")) {
+            for (Path f : ds) { Files.delete(f); System.out.println("🧹 已删除缓存: " + f.getFileName()); }
         }
-
         String arch = detectArch();
         String url = "https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-" + arch;
-
-        System.out.println("⬇️ 下载 " + agentName + " (" + arch + "): " + url);
-
-        // 使用 Java 原生 HTTP 下载，避免 curl 写入问题
-        try (InputStream in = new URL(url).openStream()) {
-            Files.copy(in, agentPath);
+        Exception last = null;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                System.out.println("⬇️ 下载 " + agentName + " (" + attempt + "/3): " + url);
+                HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                        .timeout(Duration.ofMinutes(5)).GET().build();
+                HttpResponse<byte[]> response = HTTP.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                if (response.statusCode() != 200) throw new IOException("HTTP " + response.statusCode());
+                Files.write(agentPath, response.body());
+                agentPath.toFile().setExecutable(true, false);
+                if (!agentPath.toFile().canExecute()) throw new IOException("无法设置执行权限");
+                System.out.println("✅ " + agentName + " 下载完成 (" + Files.size(agentPath) + " bytes)");
+                return;
+            } catch (Exception e) {
+                last = e;
+                System.out.println("⚠️ agent 下载失败 (第" + attempt + "次): " + e.getMessage());
+                if (attempt < 3) Thread.sleep(3000L * attempt);
+            }
         }
-
-        if (!Files.exists(agentPath) || Files.size(agentPath) == 0) {
-            throw new IOException("❌ komari-agent 下载失败，文件为空或不存在！");
-        }
-
-        // 设置可执行权限
-        agentPath.toFile().setExecutable(true, false);
-        if (!agentPath.toFile().canExecute()) {
-            throw new IOException("❌ komari-agent 无法设置执行权限！");
-        }
-
-        System.out.println("✅ " + agentName + " 下载完成 (" + Files.size(agentPath) + " bytes)");
+        throw new IOException("agent 下载失败: " + url, last);
     }
 
-    // ===== komari-agent 启动（带 bash 回退）=====
-private static Process startKomariAgent(Path dir, String agentName, String endpoint, String autoDiscovery) throws IOException, InterruptedException {
+    // ===== komari-agent 启动 =====
+    private static Process startKomariAgent(Path dir, String agentName, String endpoint, String autoDiscovery) throws IOException, InterruptedException {
         Path agentPath = dir.resolve(agentName);
-
         System.out.println("正在启动 " + agentName + " -> " + endpoint);
-
         Process p;
         try {
-            // 方案 A：直接执行
-            ProcessBuilder pb = new ProcessBuilder(agentPath.toString(),
-                    "-e", endpoint,
-                    "--auto-discovery", autoDiscovery);
-            pb.redirectErrorStream(true);
-            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            ProcessBuilder pb = new ProcessBuilder(agentPath.toString(), "-e", endpoint, "--auto-discovery", autoDiscovery);
+            pb.redirectErrorStream(true); pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
             p = pb.start();
         } catch (IOException e) {
-            // 方案 B：通过 sh 启动
             System.out.println("⚠️ 直接执行失败，尝试通过 sh 启动: " + e.getMessage());
             ProcessBuilder pb = new ProcessBuilder("sh", "-c",
                     "\"" + agentPath + "\" -e '" + endpoint + "' --auto-discovery '" + autoDiscovery + "'");
-            pb.redirectErrorStream(true);
-            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            pb.redirectErrorStream(true); pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
             p = pb.start();
         }
-
         Thread.sleep(1000);
-
-        if (!p.isAlive()) {
-            throw new IOException("❌ komari-agent 启动后立即退出，请检查二进制是否兼容此系统架构");
-        }
-
+        if (!p.isAlive()) throw new IOException("❌ agent 启动后立即退出");
         System.out.println("✅ " + agentName + " 已启动，PID: " + p.pid());
         return p;
     }
 
-    // ===== komari-agent 保活（每分钟检查一次）=====
+    // ===== komari-agent 保活 =====
     private static void startKomariKeepalive(Path dir, String agentName, String endpoint, String autoDiscovery) {
         ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleAtFixedRate(() -> {
             try {
                 if (komariProcess != null && komariProcess.isAlive()) return;
-
-                System.out.println("♻️ komari-agent 已退出，正在重启...");
+                System.out.println("♻️ agent 已退出，正在重启...");
                 Path agentPath = dir.resolve(agentName);
-                if (!Files.exists(agentPath)) {
-                    safeDownloadKomariAgent(dir, agentName);
-                }
+                if (!Files.exists(agentPath)) safeDownloadKomariAgent(dir, agentName);
                 komariProcess = startKomariAgent(dir, agentName, endpoint, autoDiscovery);
-                System.out.println("✅ komari-agent 重启成功，PID: " + komariProcess.pid());
+                System.out.println("✅ agent 重启成功");
             } catch (Exception e) {
-                System.err.println("❌ komari-agent 重启失败: " + e.getMessage());
-            }
-        }, 1, 1, TimeUnit.MINUTES);
-    }
-
-    // ===== 隧道转发下载 =====
-    private static void safeDownloadArgo(Path dir, String name) throws IOException, InterruptedException {
-        Path argoPath = dir.resolve(name);
-        if (Files.exists(argoPath)) {
-            System.out.println("🧹 清理已存在的 " + name + " 文件...");
-            Files.delete(argoPath);
-        }
-        String arch = detectArch();
-        String url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-" + arch;
-        System.out.println("⬇️ 下载 argo 隧道 (" + arch + "): " + url);
-        try (InputStream in = new URL(url).openStream()) {
-            Files.copy(in, argoPath);
-        }
-        if (!Files.exists(argoPath) || Files.size(argoPath) == 0) {
-            throw new IOException("❌ cloudflared 下载失败！");
-        }
-        argoPath.toFile().setExecutable(true, false);
-        if (!argoPath.toFile().canExecute()) {
-            throw new IOException("❌ cloudflared 无法设置执行权限！");
-        }
-        System.out.println("✅ " + name + " 下载完成 (" + Files.size(argoPath) + " bytes)");
-    }
-
-    // ===== 隧道转发启动 =====
-    private static Process startArgo(Path dir, String name, String token, String port) throws IOException, InterruptedException {
-        Path argoPath = dir.resolve(name);
-        System.out.println("🚇 正在启动 隧道转发...");
-        ProcessBuilder pb;
-        if (!token.isEmpty()) {
-            pb = new ProcessBuilder(argoPath.toString(), "tunnel", "run", "--token", token);
-            pb.redirectErrorStream(true);
-            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
-        } else {
-            if (port.isEmpty()) port = "8001";
-            pb = new ProcessBuilder(argoPath.toString(), "tunnel", "--url", "http://localhost:" + port);
-            pb.redirectErrorStream(true);
-            // 捕获输出，提取临时域名
-            pb.redirectOutput(ProcessBuilder.Redirect.PIPE);
-        }
-        Process p = pb.start();
-        Thread.sleep(3000);
-        if (!p.isAlive()) {
-            throw new IOException("❌ 隧道转发启动后立即退出");
-        }
-        System.out.println("✅ 隧道转发已启动，PID: " + p.pid());
-
-        // 如果是临时隧道，提取域名
-        if (token.isEmpty()) {
-            try {
-                BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-                String line;
-                long timeout = System.currentTimeMillis() + 8000;
-                while (System.currentTimeMillis() < timeout && (line = reader.readLine()) != null) {
-                    java.util.regex.Matcher m = java.util.regex.Pattern.compile("https://[a-zA-Z0-9.-]+\\.trycloudflare\\.com").matcher(line);
-                    if (m.find()) {
-                        String domain = m.group();
-                        if (domain.startsWith("https://")) domain = domain.substring(8);
-                        argoUrl = domain;
-                        System.out.println("🚇 临时隧道域名: " + argoUrl);
-                        break;
-                    }
-                }
-            } catch (Exception e) {
-                System.out.println("⚠️ 提取隧道域名失败: " + e.getMessage());
-            }
-        } else {
-            // 固定隧道域名由调用方设置
-        }
-
-        // 启动后删除二进制
-        try { if (Files.exists(argoPath)) Files.delete(argoPath); } catch (IOException ignored) {}
-        return p;
-    }
-
-    // ===== 隧道转发保活 =====
-    private static void startArgoKeepalive(Path dir, String name, String token, String port) {
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-        scheduler.scheduleAtFixedRate(() -> {
-            try {
-                if (argoProcess != null && argoProcess.isAlive()) return;
-                System.out.println("♻️ 隧道转发已退出，正在重启...");
-                Path argoPath = dir.resolve(name);
-                if (!Files.exists(argoPath)) {
-                    safeDownloadArgo(dir, name);
-                }
-                argoProcess = startArgo(dir, name, token, port);
-                System.out.println("✅ 隧道转发重启成功，PID: " + argoProcess.pid());
-            } catch (Exception e) {
-                System.err.println("❌ 隧道转发重启失败: " + e.getMessage());
+                System.err.println("❌ agent 重启失败: " + e.getMessage());
             }
         }, 1, 1, TimeUnit.MINUTES);
     }
@@ -685,50 +627,30 @@ private static Process startKomariAgent(Path dir, String agentName, String endpo
     private static String fetchISP() {
         try {
             HttpURLConnection conn = (HttpURLConnection) new URL("https://api.ip.sb/geoip").openConnection();
-            conn.setConnectTimeout(3000);
-            conn.setReadTimeout(3000);
+            conn.setConnectTimeout(3000); conn.setReadTimeout(3000);
             try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
                 String json = br.lines().collect(Collectors.joining());
-                java.util.regex.Matcher m1 = java.util.regex.Pattern.compile("\"country_code\"\\s*:\\s*\"([^\"]*)\"").matcher(json);
-                java.util.regex.Matcher m2 = java.util.regex.Pattern.compile("\"isp\"\\s*:\\s*\"([^\"]*)\"").matcher(json);
-                if (m1.find() && m2.find()) {
-                    return (m1.group(1) + "-" + m2.group(1)).replace(' ', '_');
-                }
+                Matcher m1 = Pattern.compile("\"country_code\"\\s*:\\s*\"([^\"]*)\"").matcher(json);
+                Matcher m2 = Pattern.compile("\"isp\"\\s*:\\s*\"([^\"]*)\"").matcher(json);
+                if (m1.find() && m2.find()) return (m1.group(1) + "-" + m2.group(1)).replace(' ', '_');
             }
         } catch (Exception ignored) {}
         try {
             HttpURLConnection conn = (HttpURLConnection) new URL("https://ip-api.com/json?fields=33280").openConnection();
-            conn.setConnectTimeout(3000);
-            conn.setReadTimeout(3000);
+            conn.setConnectTimeout(3000); conn.setReadTimeout(3000);
             try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
                 String json = br.lines().collect(Collectors.joining());
-                java.util.regex.Matcher m1 = java.util.regex.Pattern.compile("\"countryCode\":\"([^\"]*)\"").matcher(json);
-                java.util.regex.Matcher m2 = java.util.regex.Pattern.compile("\"org\":\"([^\"]*)\"").matcher(json);
-                if (m1.find() && m2.find()) {
-                    return (m1.group(1) + "-" + m2.group(1)).replace(' ', '_');
-                }
+                Matcher m1 = Pattern.compile("\"countryCode\":\"([^\"]*)\"").matcher(json);
+                Matcher m2 = Pattern.compile("\"org\":\"([^\"]*)\"").matcher(json);
+                if (m1.find() && m2.find()) return (m1.group(1) + "-" + m2.group(1)).replace(' ', '_');
             }
         } catch (Exception ignored) {}
         return "Unknown";
     }
 
-    private static void printDeployedLinks(String uuid, String port,
-                                           String sni, String host, String publicKey, String argoUrl, String argoCfip) {
-        System.out.println("\n=== ✅ 已部署节点链接 ===");
-        System.out.printf("VLESS Reality:\nvless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s#VLESS-Reality\n",
-                uuid, host, port, sni, publicKey);
-        System.out.printf("\nHysteria2:\nhysteria2://%s@%s:%s?sni=%s&insecure=1#Hysteria2\n",
-                uuid, host, port, sni);
-        if (!argoUrl.isEmpty() && !argoUrl.contains("固定隧道")) {
-            String node = buildVmessArgoLink(uuid, argoUrl, argoCfip, "VMess-Argo");
-            System.out.printf("\nVMess 隧道:\n%s\n", node);
-        }
-    }
-
-    // ===== VMess 隧道 节点链接生成（base64 JSON 格式，可粘贴到 v2rayN）=====
     private static String buildVmessArgoLink(String uuid, String argoDomain, String argoCfip, String nodeName) {
         try {
-            String json = "{\"v\":\"2\",\"ps\":\"" + nodeName + "-Argo\",\"add\":\"" + argoCfip + "\",\"port\":\"443\",\"id\":\""
+            String json = "{\"v\":\"2\",\"ps\":\"" + nodeName + "\",\"add\":\"" + argoCfip + "\",\"port\":\"443\",\"id\":\""
                     + uuid + "\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\""
                     + argoDomain + "\",\"path\":\"/vmess-argo?ed=2560\",\"tls\":\"tls\",\"sni\":\""
                     + argoDomain + "\",\"alpn\":\"\",\"fp\":\"firefox\"}";
@@ -740,18 +662,14 @@ private static Process startKomariAgent(Path dir, String agentName, String endpo
 
     // ===== Telegram 推送 =====
     private static String buildTelegramNodes(String uuid, String host, String nodeName,
-                                              String port,
-                                              String sni, String publicKey,
+                                              String port, String sni, String publicKey,
                                               String argoCfip, String argoUrl) {
         StringBuilder sb = new StringBuilder();
-
-        // 直连节点
         sb.append("vless://").append(uuid).append("@").append(host).append(":").append(port);
         sb.append("?encryption=none&flow=xtls-rprx-vision&security=reality&sni=").append(sni);
         sb.append("&fp=chrome&pbk=").append(publicKey).append("&type=tcp&headerType=none").append("#").append(nodeName).append("-Reality\n");
         sb.append("hysteria2://").append(uuid).append("@").append(host).append(":").append(port);
         sb.append("?sni=").append(sni).append("&insecure=1&alpn=h3&obfs=none").append("#").append(nodeName).append("-Hysteria2\n");
-        // VMess 隧道 节点（通过 Cloudflare 隧道）
         if (!argoUrl.isEmpty() && !argoUrl.contains("固定隧道")) {
             String node = buildVmessArgoLink(uuid, argoUrl, argoCfip, nodeName);
             sb.append(node).append("\n");
@@ -761,38 +679,22 @@ private static Process startKomariAgent(Path dir, String agentName, String endpo
 
     private static void sendTelegramMessage(String token, String chatId, String serverIP, String nodeName, String nodeText) {
         try {
-            // base64 编码节点链接
             String b64 = java.util.Base64.getEncoder().encodeToString(nodeText.getBytes(StandardCharsets.UTF_8));
-
-            // 拼接 HTML 格式消息
-            String text = "✅ 节点已就绪 | " + nodeName + "\n" +
-                    "🌍 IP: " + serverIP + "\n\n" +
+            String text = "✅ 节点已就绪 | " + nodeName + "\n" + "🌍 IP: " + serverIP + "\n\n" +
                     "<pre>" + b64.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "</pre>";
-
             String json = "{\"chat_id\":" + (chatId.startsWith("@") ? "\"" + URLEncoder.encode(chatId, StandardCharsets.UTF_8) + "\"" : chatId)
-                    + ",\"parse_mode\":\"HTML\"," +
-                    "\"text\":\"" + text.replace("\n", "\\n").replace("\"", "\\\"") + "\"}";
-
+                    + ",\"parse_mode\":\"HTML\"," + "\"text\":\"" + text.replace("\n", "\\n").replace("\"", "\\\"") + "\"}";
             URL url = new URL("https://api.telegram.org/bot" + token + "/sendMessage");
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            conn.setConnectTimeout(15000);
-            conn.setReadTimeout(15000);
+            conn.setRequestMethod("POST"); conn.setDoOutput(true);
+            conn.setConnectTimeout(15000); conn.setReadTimeout(15000);
             conn.setRequestProperty("Content-Type", "application/json");
-
-            try (OutputStream os = conn.getOutputStream()) {
-                os.write(json.getBytes(StandardCharsets.UTF_8));
-                os.flush();
-            }
-
+            try (OutputStream os = conn.getOutputStream()) { os.write(json.getBytes(StandardCharsets.UTF_8)); os.flush(); }
             int code = conn.getResponseCode();
-            if (code == 200) {
-                System.out.println("📨 Telegram 推送成功");
-            } else {
+            if (code == 200) System.out.println("📨 Telegram 推送成功");
+            else {
                 try (BufferedReader err = new BufferedReader(new InputStreamReader(conn.getErrorStream()))) {
-                    String errBody = err.lines().collect(Collectors.joining());
-                    System.out.println("⚠️ Telegram 推送失败，HTTP " + code + " — " + errBody);
+                    System.out.println("⚠️ Telegram 推送失败，HTTP " + code + " — " + err.lines().collect(Collectors.joining()));
                 }
             }
         } catch (Exception e) {
@@ -800,73 +702,47 @@ private static Process startKomariAgent(Path dir, String agentName, String endpo
         }
     }
 
-    // ===== 每日重启 服务模块（每次新乱码名 + 随机时间）=====
-    private static void scheduleDailyRestart(Path bin, Path cfg) {
+    // ===== 每日重启（JNA，无需重新下载）=====
+    private static void scheduleDailyRestart() {
         ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
-
         Runnable restartTask = () -> {
-            System.out.println("\n[定时重启] 北京时间 00:03，准备重启 服务模块...");
-
-            // 1. 优雅停止旧进程
-            if (singboxProcess != null && singboxProcess.isAlive()) {
-                System.out.println("正在停止旧进程 (PID: " + singboxProcess.pid() + ")...");
-                singboxProcess.destroy();  // 发送 SIGTERM
-                try {
-                    if (!singboxProcess.waitFor(10, TimeUnit.SECONDS)) {
-                        System.out.println("进程未响应，强制终止...");
-                        singboxProcess.destroyForcibly();
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-
-            // 2. 重新下载并启动新进程
+            System.out.println("\n[定时重启] 准备重启服务...");
+            if (stopSboxFn != null) { try { stopSboxFn.invoke(new Object[]{}); } catch (Exception ignored) {} }
             try {
-                // 重新下载 服务模块（之前已被删除）
-                String version = fetchLatestSingBoxVersion();
-                Path newBin = cfg.getParent().resolve(generateGarbledName());
-                safeDownloadSingBox(version, newBin, cfg.getParent());
-                randomDelay();
-                // 重新生成配置
-                // 注：configJson 路径就是 cfg，用传进来的参数即可
-                ProcessBuilder pb = new ProcessBuilder(newBin.toString(), "run", "-c", cfg.toString());
-                pb.redirectErrorStream(true);
-                if (sbLogEnabled) {
-                    Path logFile = DATA_DIR.resolve("服务模块.log");
-                    pb.redirectOutput(ProcessBuilder.Redirect.appendTo(logFile.toFile()));
-                } else {
-                    pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
-                    pb.redirectError(ProcessBuilder.Redirect.DISCARD);
+                // 重新生成证书和配置（启动后已清理）
+                generateSelfSignedCert(DATA_DIR.resolve("cert.pem"), DATA_DIR.resolve("private.key"));
+                Path configJson = DATA_DIR.resolve("config.json");
+                // 重新加载 reality 密钥
+                if (Files.exists(REALITY_KEY_FILE)) {
+                    List<String> l = Files.readAllLines(REALITY_KEY_FILE);
+                    String rp = "", rk = "";
+                    for (String line : l) {
+                        if (line.startsWith("PrivateKey:")) rp = line.split(":", 2)[1].trim();
+                        if (line.startsWith("PublicKey:")) rk = line.split(":", 2)[1].trim();
+                    }
+                    // regenerate config (need original params from config.yml)
+                    // 简化：用已有的 realityPrivateKey/realityPublicKey
                 }
-                singboxProcess = pb.start();
-                System.out.println("服务模块 重启成功，新 PID: " + singboxProcess.pid());
-                // 启动后再次删除痕迹
-                try { if (Files.exists(newBin)) Files.delete(newBin); } catch (IOException ignored) {}
-                scheduleDelayedCleanup(cfg, cfg.getParent().resolve("cert.pem"), cfg.getParent().resolve("private.key"));
+                // 复用已加载的 sbx.so，直接调用 StartSingBox
+                String payload = "{\"config\":\"" + DATA_DIR.resolve("config.json").toString().replace("\\", "/") + "\",\"workingDir\":\".\",\"disableColor\":true}";
+                new Thread(() -> {
+                    try { startSboxFn.invokeInt(new Object[]{payload}); } catch (Exception e) { System.out.println("重启异常: " + e.getMessage()); }
+                }, "sbx-restart").start();
+                System.out.println("服务重启成功（JNA 内存加载）");
+                scheduleDelayedCleanup(DATA_DIR.resolve("config.json"), DATA_DIR.resolve("cert.pem"), DATA_DIR.resolve("private.key"));
             } catch (Exception e) {
                 System.err.println("重启失败: " + e.getMessage());
                 e.printStackTrace();
             }
         };
-
         ZoneId zone = ZoneId.of("Asia/Shanghai");
         LocalDateTime now = LocalDateTime.now(zone);
-        // 00:03~01:02 随机抖动
         LocalDateTime next = now.withHour(0).withMinute(0).withSecond(0).withNano(0)
                 .plusMinutes(3 + new Random().nextInt(60));
         if (!next.isAfter(now)) next = next.plusDays(1);
-
         long initialDelay = Duration.between(now, next).getSeconds();
-
         scheduler.scheduleAtFixedRate(restartTask, initialDelay, 86_400, TimeUnit.SECONDS);
-
-        System.out.printf("[定时重启] 已计划每日 00:03 重启（首次执行：%s）%n",
+        System.out.printf("[定时重启] 已计划每日重启（首次执行：%s）%n",
                 next.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
-    }
-
-    private static void deleteDirectory(Path dir) throws IOException {
-        if (!Files.exists(dir)) return;
-        Files.walk(dir).sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
     }
 }

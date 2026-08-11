@@ -12,6 +12,7 @@ repositories {
 
 dependencies {
     implementation("org.yaml:snakeyaml:2.3")
+    implementation("net.java.dev.jna:jna:5.14.0")
 }
 
 java {
