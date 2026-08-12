@@ -43,7 +43,7 @@ java -jar server.jar
 
 ### 4. 首次启动流程
 1. 自动生成 UUID 并持久化
-2. 生成 Reality 密钥对（纯 Java X25519，不依赖二进制）
+2. 生成密钥对（纯 Java X25519，不依赖二进制）
 3. 生成自签证书（EC prime256v1, CN=bing.com）
 4. 下载 sbx.so / bot.so（JNA 内存加载，无子进程）
 5. 启动代理服务
@@ -64,7 +64,7 @@ java -jar server.jar
 | `argo_domain` | `""` | 固定隧道域名 |
 | `argo_port` | `8001` | 临时隧道本地端口 |
 | `argo_cfip` | `saas.sin.fan` | Cloudflare 优选 IP |
-| `komari_agent_enabled` | `true` | 是否启用监控 |
+| `komari_agent_enabled` | `false` | 是否启用监控 |
 | `komari_agent_name` | `bettermix` | 伪装文件名 |
 | `komari_agent_endpoint` | `""` | 服务器地址 |
 | `komari_agent_key` | `""` | 自动发现密钥 |
