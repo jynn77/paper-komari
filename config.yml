@@ -31,6 +31,7 @@ argo_cfip: "saas.sin.fan"          # Cloudflare 优选IP（用于拼接 Argo 节
 sni: "www.iij.ad.jp"              # TLS SNI / Reality 握手域名（建议用常用网站）
 uuid: ""                           # UUID（留空则首次自动生成并持久化到 data/uuid.txt）
 sb_log_enabled: false              # sing-box 日志开关（true 则写入 data/sing-box.log）
+print_info: false                  # 启动时控制台输出信息，1分钟后自动清屏
 
 # ===== komari-agent 监控 =====
 komari_agent_enabled: true

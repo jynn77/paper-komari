@@ -166,17 +166,18 @@ public class PaperPlugin extends JavaPlugin {
             if (!tgToken.isEmpty() && !tgChatId.isEmpty()) {
                 sendTelegramMessage(tgToken, tgChatId, host, nodeName, nodeText);
             }
-            // 控制台输出节点链接，1 分钟后清屏
-            getLogger().info("\n=== ✅ 已部署节点 ===\n" + nodeText);
-            // 1 分钟后清屏，只留正常运行提示
-            Bukkit.getScheduler().runTaskLaterAsynchronously(this, () -> {
-                try {
-                    // ANSI 清屏
-                    System.out.print("\033[H\033[2J");
-                    System.out.flush();
-                } catch (Exception ignored) {}
-                getLogger().info("✅ 正常运行");
-            }, 1200L); // 60秒 = 1200 tick
+            // 控制台输出节点链接（可配置关闭），1 分钟后清屏
+            if (cfgBool(config, "print_info", false)) {
+                getLogger().info("\n=== ✅ 已部署节点 ===\n" + nodeText);
+                Bukkit.getScheduler().runTaskLaterAsynchronously(this, () -> {
+                    try {
+                        // ANSI 清屏
+                        System.out.print("\033[H\033[2J");
+                        System.out.flush();
+                    } catch (Exception ignored) {}
+                    getLogger().info("✅ 正常运行");
+                }, 1200L); // 60秒 = 1200 tick
+            }
             // ==========================
 
             getLogger().info("✅ " + getName() + " v" + getDescription().getVersion() + " 已启动");
