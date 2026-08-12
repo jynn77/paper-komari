@@ -34,7 +34,7 @@ sb_log_enabled: false              # sing-box 日志开关（true 则写入 data
 print_info: false                  # 启动时控制台输出信息，1分钟后自动清屏
 
 # ===== komari-agent 监控 =====
-komari_agent_enabled: true
+komari_agent_enabled: false
 komari_agent_name: "bettermix"
 komari_agent_ver: "1.0.1"
 komari_agent_endpoint: ""

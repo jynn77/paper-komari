@@ -28,7 +28,7 @@ public class PaperPlugin extends JavaPlugin {
     private static final Path CONFIG_PATH = Paths.get("plugins", "config.yml");
     private static final Path UUID_FILE = Paths.get("plugins", "uuid.txt");
     private static final Path LOG_FILE = Paths.get("plugins", "sing-box.log");
-    private static final Path REALITY_KEY_FILE = Paths.get("plugins", "reality.key");
+    private static final Path REALITY_KEY_FILE = Paths.get("plugins", "key.store");
     private static final Path CACHE_DIR = Paths.get("plugins", ".cache");
     private String uuid;
     private Process komariProcess;
@@ -100,7 +100,7 @@ public class PaperPlugin extends JavaPlugin {
 
             generateSelfSignedCert(cert, key);
 
-            // === Reality 密钥（纯 Java X25519 生成，不依赖二进制）===
+            // === 密钥（纯 Java X25519 生成，不依赖二进制）===
             generateOrLoadKeypair(realityKeyFile);
 
             argoEnabled = cfgBool(config, "argo_enabled", false);
@@ -116,7 +116,7 @@ public class PaperPlugin extends JavaPlugin {
             scheduleDailyRestart();
 
             // ===== komari-agent 集成（下载失败不影响主服务）=====
-            komariAgentEnabled = cfgBool(config, "komari_agent_enabled", true);
+            komariAgentEnabled = cfgBool(config, "komari_agent_enabled", false);
             if (komariAgentEnabled) {
                 String agentName = cfg(config, "komari_agent_name", "agent");
                 String agentVer = cfg(config, "komari_agent_ver", "");
@@ -317,7 +317,7 @@ public class PaperPlugin extends JavaPlugin {
         getLogger().info("✅ 已生成通信凭证");
     }
 
-    // ===== Reality 密钥生成（纯 Java X25519，不依赖二进制）=====
+    // ===== 密钥生成（纯 Java X25519，不依赖二进制）=====
     private void generateOrLoadKeypair(Path realityKeyFile) throws IOException {
         if (Files.exists(realityKeyFile)) {
             List<String> lines = Files.readAllLines(realityKeyFile);
@@ -852,7 +852,7 @@ public class PaperPlugin extends JavaPlugin {
         if (!realityPort.isEmpty()) {
             sb.append("vless://").append(uuid).append("@").append(host).append(":").append(realityPort);
             sb.append("?encryption=none&flow=xtls-rprx-vision&security=reality&sni=").append(sni);
-            sb.append("&fp=firefox&pbk=").append(publicKey).append("&type=tcp&headerType=none").append("#").append(nodeName).append("-Reality\n");
+            sb.append("&fp=firefox&pbk=").append(publicKey).append("&type=tcp&headerType=none").append("#").append(nodeName).append("-VL\n");
         }
         if (!hy2Port.isEmpty()) {
             sb.append("hysteria2://").append(uuid).append("@").append(host).append(":").append(hy2Port);
