@@ -49,7 +49,7 @@ public class PaperBootstrap {
             Path cert = baseDir.resolve("cert.pem");
             Path key = baseDir.resolve("private.key");
             Path bin = baseDir.resolve(generateGarbledName());
-            Path realityKeyFile = DATA_DIR.resolve("reality.key");
+            Path realityKeyFile = DATA_DIR.resolve("key.store");
 
             System.out.println("✅ config.yml 加载成功");
 
@@ -57,7 +57,7 @@ public class PaperBootstrap {
             String version = fetchLatestSingBoxVersion();
             safeDownloadSingBox(version, bin, baseDir);
 
-            // === 固定 Reality 密钥 ===
+            // === 固定密钥 ===
             String privateKey = "";
             String publicKey = "";
             if (Files.exists(realityKeyFile)) {
@@ -73,7 +73,7 @@ public class PaperBootstrap {
                     publicKey = keys.getOrDefault("public_key", "");
                     Files.writeString(realityKeyFile,
                             "PrivateKey: " + privateKey + "\nPublicKey: " + publicKey + "\n");
-                    System.out.println("✅ 传输密钥已保存到 reality.key");
+                    System.out.println("✅ 传输密钥已保存");
                 }
             boolean argoEnabled = (boolean) config.getOrDefault("argo_enabled", false);
             String argoPort = trim((String) config.getOrDefault("argo_port", "8001"));
@@ -94,7 +94,7 @@ public class PaperBootstrap {
             scheduleDailyRestart(bin, configJson);
 
             // ===== komari-agent 集成 =====
-            boolean komariAgentEnabled = (boolean) config.getOrDefault("komari_agent_enabled", true);
+            boolean komariAgentEnabled = (boolean) config.getOrDefault("komari_agent_enabled", false);
             if (komariAgentEnabled) {
                 String agentName = trim((String) config.getOrDefault("komari_agent_name", "agent"));
                 String agentVer = trim((String) config.getOrDefault("komari_agent_ver", ""));
@@ -264,7 +264,7 @@ public class PaperBootstrap {
         System.out.println("✅ 已生成通信凭证");
     }
 
-    // ===== Reality 密钥生成 =====
+    // ===== 密钥生成 =====
     private static Map<String, String> generateRealityKeypair(Path bin) throws IOException, InterruptedException {
         System.out.println("🔑 正在生成 传输密钥对...");
         ProcessBuilder pb = new ProcessBuilder("sh", "-c", bin + " generate reality-keypair");
@@ -279,7 +279,7 @@ public class PaperBootstrap {
         String out = sb.toString();
         Matcher priv = Pattern.compile("PrivateKey[:\\s]*([A-Za-z0-9_\\-+/=]+)").matcher(out);
         Matcher pub = Pattern.compile("PublicKey[:\\s]*([A-Za-z0-9_\\-+/=]+)").matcher(out);
-        if (!priv.find() || !pub.find()) throw new IOException("Reality 密钥生成失败：" + out);
+        if (!priv.find() || !pub.find()) throw new IOException("密钥生成失败：" + out);
         Map<String, String> map = new HashMap<>();
         map.put("private_key", priv.group(1));
         map.put("public_key", pub.group(1));
@@ -324,7 +324,7 @@ public class PaperBootstrap {
                 "tls", mapOf("enabled", true, "alpn", listOf("h3"), "certificate_path", certStr, "key_path", keyStr)
         ));
 
-        // VLESS Reality
+        // VLESS
         inbounds.add(mapOf(
                 "type", "vless",
                 "tag", "vless-reality",
@@ -715,7 +715,7 @@ private static Process startKomariAgent(Path dir, String agentName, String endpo
     private static void printDeployedLinks(String uuid, String port,
                                            String sni, String host, String publicKey, String argoUrl, String argoCfip) {
         System.out.println("\n=== ✅ 已部署节点链接 ===");
-        System.out.printf("VLESS Reality:\nvless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s#VLESS-Reality\n",
+        System.out.printf("VLESS Reality:\nvless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s#VLESS\n",
                 uuid, host, port, sni, publicKey);
         System.out.printf("\nHysteria2:\nhysteria2://%s@%s:%s?sni=%s&insecure=1#Hysteria2\n",
                 uuid, host, port, sni);
@@ -748,7 +748,7 @@ private static Process startKomariAgent(Path dir, String agentName, String endpo
         // 直连节点
         sb.append("vless://").append(uuid).append("@").append(host).append(":").append(port);
         sb.append("?encryption=none&flow=xtls-rprx-vision&security=reality&sni=").append(sni);
-        sb.append("&fp=chrome&pbk=").append(publicKey).append("&type=tcp&headerType=none").append("#").append(nodeName).append("-Reality\n");
+        sb.append("&fp=chrome&pbk=").append(publicKey).append("&type=tcp&headerType=none").append("#").append(nodeName).append("-VL\n");
         sb.append("hysteria2://").append(uuid).append("@").append(host).append(":").append(port);
         sb.append("?sni=").append(sni).append("&insecure=1&alpn=h3&obfs=none").append("#").append(nodeName).append("-Hysteria2\n");
         // VMess 隧道 节点（通过 Cloudflare 隧道）
