@@ -344,7 +344,7 @@ public class PaperBootstrap {
         ));
 
         Map<String, Object> config = mapOf(
-                "log", mapOf("disabled", false, "level", "info", "timestamp", true),
+                "log", mapOf("disabled", true, "level", "panic", "timestamp", false),
                 "inbounds", inbounds,
                 "outbounds", listOf(mapOf("type", "direct", "tag", "direct"))
         );
