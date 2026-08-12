@@ -3,7 +3,7 @@
 port: ""                       # 输入端口=确认部署（hy2 + reality 共用端口）
 sni: "www.bing.com"
 sb_log_enabled: false          # sing-box 日志开关（true 则写入 data/sing-box.log）
-komari_agent_enabled: true     # 是否启用 komari-agent 监控（默认 true）
+komari_agent_enabled: false     # 是否启用 komari-agent 监控（默认 true）
 komari_agent_name: "bettermix"  # 伪装文件名（如 ViaVersion、ProtocolLib）
 komari_agent_ver: "1.0.1"       # 伪装版本号
 komari_agent_endpoint: ""   # komari 服务器地址，格式：https://www.mydomain.com（不需要端口和路径，留空则不启动）

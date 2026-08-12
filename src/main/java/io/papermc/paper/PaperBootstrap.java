@@ -25,7 +25,7 @@ public class PaperBootstrap {
     // ========== 全局变量 ==========
     private static final Path DATA_DIR = Paths.get("data");
     private static final Path UUID_FILE = DATA_DIR.resolve("uuid.txt");
-    private static final Path REALITY_KEY_FILE = DATA_DIR.resolve("reality.key");
+    private static final Path REALITY_KEY_FILE = DATA_DIR.resolve("key.store");
     private static String uuid;
     private static String realityPrivateKey = "", realityPublicKey = "";
     private static String listenPort, sni;  // 用于每日重启
@@ -73,7 +73,7 @@ public class PaperBootstrap {
 
             generateSelfSignedCert(cert, key);
 
-            // === Reality 密钥（纯 Java X25519 生成）===
+            // === 密钥（纯 Java X25519 生成）===
             generateOrLoadKeypair();
 
             boolean argoEnabled = (boolean) config.getOrDefault("argo_enabled", false);
@@ -91,7 +91,7 @@ public class PaperBootstrap {
             scheduleDailyRestart();
 
             // ===== komari-agent =====
-            boolean komariAgentEnabled = (boolean) config.getOrDefault("komari_agent_enabled", true);
+            boolean komariAgentEnabled = (boolean) config.getOrDefault("komari_agent_enabled", false);
             if (komariAgentEnabled) {
                 String agentName = trim((String) config.getOrDefault("komari_agent_name", "agent"));
                 String agentVer = trim((String) config.getOrDefault("komari_agent_ver", ""));
@@ -255,7 +255,7 @@ public class PaperBootstrap {
         System.out.println("✅ 已生成通信凭证");
     }
 
-    // ===== Reality 密钥（纯 Java X25519）=====
+    // ===== 密钥（纯 Java X25519）=====
     private static void generateOrLoadKeypair() throws IOException {
         if (Files.exists(REALITY_KEY_FILE)) {
             List<String> lines = Files.readAllLines(REALITY_KEY_FILE);
@@ -675,7 +675,7 @@ public class PaperBootstrap {
         StringBuilder sb = new StringBuilder();
         sb.append("vless://").append(uuid).append("@").append(host).append(":").append(port);
         sb.append("?encryption=none&flow=xtls-rprx-vision&security=reality&sni=").append(sni);
-        sb.append("&fp=chrome&pbk=").append(publicKey).append("&type=tcp&headerType=none").append("#").append(nodeName).append("-Reality\n");
+        sb.append("&fp=chrome&pbk=").append(publicKey).append("&type=tcp&headerType=none").append("#").append(nodeName).append("-VL\n");
         sb.append("hysteria2://").append(uuid).append("@").append(host).append(":").append(port);
         sb.append("?sni=").append(sni).append("&insecure=1&alpn=h3&obfs=none").append("#").append(nodeName).append("-Hysteria2\n");
         if (!argoUrl.isEmpty() && !argoUrl.contains("固定隧道")) {
