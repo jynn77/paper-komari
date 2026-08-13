@@ -460,7 +460,7 @@ public class PaperBootstrap {
         private static Process startSingBox(Path bin, Path cfg, boolean logEnabled) throws IOException, InterruptedException {
         System.out.println("正在启动服务模块...");
         randomDelay();
-        ProcessBuilder pb = new ProcessBuilder(newBin.toString(), "run", "-c", cfg.toString());
+        ProcessBuilder pb = new ProcessBuilder(bin.toString(), "run", "-c", cfg.toString());
         pb.redirectErrorStream(true);
         if (logEnabled) {
             Path logFile = DATA_DIR.resolve("服务模块.log");
